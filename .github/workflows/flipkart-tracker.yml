@@ -1,0 +1,117 @@
+# ============================================================
+# Flipkart Product Tracker - GitHub Actions Workflow
+# ============================================================
+# Runs 3x daily at 10:30 AM, 4:30 PM, 10:30 PM IST
+# Splits 774 FSNs across 4 parallel jobs (~49 min each)
+#
+# IMPORTANT: This must be in a PUBLIC repository for FREE
+# unlimited minutes. Private repos have a 2000 min/month limit.
+# ============================================================
+
+name: Flipkart Tracker
+
+on:
+  # Scheduled runs (cron is in UTC; IST = UTC + 5:30)
+  # 10:30 AM IST = 05:00 UTC
+  # 4:30 PM IST  = 11:00 UTC
+  # 10:30 PM IST = 17:00 UTC
+  schedule:
+    - cron: '0 5 * * *'    # 10:30 AM IST
+    - cron: '0 11 * * *'   # 4:30 PM IST
+    - cron: '0 17 * * *'   # 10:30 PM IST
+
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+    inputs:
+      chunks:
+        description: 'Number of parallel chunks (1-8)'
+        required: false
+        default: '4'
+
+# Prevent multiple runs from overlapping
+concurrency:
+  group: flipkart-tracker
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    name: Scrape chunk ${{ matrix.chunk }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240  # 4 hours max per job (safety net)
+
+    strategy:
+      matrix:
+        chunk: [0, 1, 2, 3]
+      fail-fast: false  # Don't cancel other chunks if one fails
+      max-parallel: 4   # All 4 chunks run simultaneously
+
+    env:
+      TOTAL_CHUNKS: 4
+      GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: cloud/package-lock.json
+
+      - name: Install dependencies
+        working-directory: cloud
+        run: npm ci || npm install
+
+      - name: Install Chromium system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 \
+            libatk-bridge2.0-0 \
+            libdrm2 \
+            libxkbcommon0 \
+            libgbm1 \
+            libasound2 \
+            libatspi2.0-0 \
+            libxshmfence1
+
+      - name: Run scraper (chunk ${{ matrix.chunk }})
+        working-directory: cloud
+        run: |
+          echo "Starting chunk ${{ matrix.chunk }} of $TOTAL_CHUNKS"
+          echo "Time (IST): $(TZ=Asia/Kolkata date)"
+          node scraper-cloud.js --chunk ${{ matrix.chunk }} --total-chunks $TOTAL_CHUNKS
+        timeout-minutes: 220
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-log-chunk-${{ matrix.chunk }}
+          path: cloud/*.log
+          retention-days: 3
+
+  # Summary job that runs after all chunks complete
+  summary:
+    name: Run Summary
+    needs: scrape
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Report status
+        run: |
+          echo "=== Flipkart Tracker Run Summary ==="
+          echo "Time (IST): $(TZ=Asia/Kolkata date)"
+          echo "Triggered by: ${{ github.event_name }}"
+          echo ""
+          echo "Chunk results:"
+          echo "  Chunk 0: ${{ needs.scrape.result }}"
+          echo ""
+          if [ "${{ needs.scrape.result }}" = "success" ]; then
+            echo "All chunks completed successfully!"
+          else
+            echo "WARNING: Some chunks had issues. Check the logs above."
+          fi

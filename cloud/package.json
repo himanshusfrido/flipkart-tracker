@@ -1,0 +1,14 @@
+{
+  "name": "flipkart-tracker-cloud",
+  "version": "1.0.0",
+  "description": "Flipkart product tracker - cloud deployment for GitHub Actions",
+  "main": "scraper-cloud.js",
+  "scripts": {
+    "scrape": "node scraper-cloud.js",
+    "scrape:chunk": "node scraper-cloud.js --chunk $CHUNK_INDEX --total-chunks $TOTAL_CHUNKS",
+    "test": "node scraper-cloud.js --chunk 0 --total-chunks 774"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0"
+  }
+}

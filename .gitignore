@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Auth & secrets - NEVER commit these
+service-account-key.json
+.clasprc.json
+.env
+*.credentials
+credentials.json
+
+# Root package-lock (cloud/ has its own)
+/package-lock.json
+
+# Local-only directories
+logs/
+csv_backups/
+clasp-project/
+
+# Development/test files
+test*.js
+scraper.js
+test_api.js
+test_scraper.js
+
+# Setup artifacts
+Code.gs
+SETUP_GUIDE.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
