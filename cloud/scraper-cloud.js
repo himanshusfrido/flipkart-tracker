@@ -26,7 +26,6 @@ const PINCODES = ['110001', '560001', '400098', '411045'];
 const CITY_NAMES = ['Delhi', 'Bangalore', 'Mumbai', 'Pune'];
 const FSN_FILE = path.join(__dirname, '..', 'FSN_LIST.txt');
 const BATCH_SIZE = 10; // Write to Google Sheet every N FSNs
-const MAX_RETRIES = 2; // Retry failed scrapes
 const PAGE_TIMEOUT = 45000;
 
 // ─── PARSE CLI ARGS ─────────────────────────────────────────
@@ -158,7 +157,7 @@ function sheetsAPI(method, apiPath, body, token) {
 
 async function writeToSheet(rows, startRow, token) {
   const endRow = startRow + rows.length - 1;
-  const range = `Tracker!A${startRow}:Q${endRow}`;
+  const range = `Tracker!A${startRow}:M${endRow}`;
   await sheetsAPI('PUT',
     `/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=RAW`,
     { range, values: rows },
@@ -168,168 +167,144 @@ async function writeToSheet(rows, startRow, token) {
 }
 
 // ─── FLIPKART SCRAPER ──────────────────────────────────────
-async function scrapeProduct(page, fsn, pincode) {
+
+// Load a product page once, extract product info (name, MRP, SP) from JSON-LD
+async function loadProductPage(page, fsn) {
   try {
-    const url = `https://www.flipkart.com/product/p/itm?pid=${fsn}`;
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
-    await delay(2500);
+    await page.goto(`https://www.flipkart.com/product/p/itm?pid=${fsn}`, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
+    await delay(1500);
 
-    // Close login popup if present
+    // Close login popup
     try {
-      const closeBtns = await page.$$('button');
-      for (const btn of closeBtns) {
-        const text = await page.evaluate(el => el.textContent, btn);
-        if (text.includes('\u2715') || text.includes('\u00D7')) {
-          await btn.click();
-          await delay(500);
-          break;
-        }
+      const btns = await page.$$('button');
+      for (const b of btns) {
+        const t = await page.evaluate(el => el.textContent, b);
+        if (t.includes('\u2715') || t.includes('\u00D7')) { await b.click(); break; }
       }
-    } catch (e) { /* popup may not appear */ }
+    } catch (e) {}
+    await delay(300);
 
-    // Enter pincode
-    try {
-      // First try direct pincode input on the page
-      let pincodeInput = await page.$('input[id="pincodeInputId"]') ||
-                         await page.$('input[placeholder*="pincode" i]') ||
-                         await page.$('input[placeholder*="Pincode" i]');
+    // Extract product info from JSON-LD structured data (most reliable)
+    const info = await page.evaluate(() => {
+      let name = 'N/A', mrp = 'N/A', sp = 'N/A', available = true;
 
-      // If not found, try clicking "Select delivery location" to open popup
-      if (!pincodeInput) {
-        const elements = await page.$$('a, div, span');
-        for (const el of elements) {
-          const text = await page.evaluate(e => e.textContent.trim(), el);
-          if (text === 'Select delivery location' || text.includes('Select delivery location')) {
-            await el.click();
-            await delay(2000);
+      // Try JSON-LD first
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      for (const s of scripts) {
+        try {
+          const data = JSON.parse(s.textContent);
+          const product = Array.isArray(data) ? data[0] : data;
+          if (product['@type'] === 'Product' && product.name) {
+            name = product.name;
+            if (product.offers) {
+              const offer = product.offers;
+              if (offer.price) sp = '\u20B9' + Number(offer.price).toLocaleString('en-IN');
+              if (offer.availability && offer.availability.includes('OutOfStock')) available = false;
+            }
             break;
           }
-        }
-        // Search for input again after popup
-        const allInputs = await page.$$('input');
-        for (const inp of allInputs) {
-          const ph = await page.evaluate(e => (e.placeholder || '').toLowerCase(), inp);
-          if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter')) {
-            pincodeInput = inp;
-            break;
-          }
-        }
+        } catch (e) {}
       }
 
-      if (pincodeInput) {
-        await pincodeInput.click({ clickCount: 3 });
-        await delay(200);
-        await pincodeInput.type(pincode, { delay: 30 });
-        await delay(300);
-
-        // Find and click Check/Apply button
-        const btns = await page.$$('span, button');
-        for (const btn of btns) {
-          const text = await page.evaluate(el => el.textContent.trim(), btn);
-          if (text === 'Check' || text === 'Apply' || text === 'Change' || text === 'Submit') {
-            await btn.click();
-            break;
-          }
-        }
-        await delay(2500);
-      }
-    } catch (e) {
-      console.log(`  Pincode entry failed for ${fsn}: ${e.message}`);
-    }
-
-    // Extract all data from page
-    const data = await page.evaluate(() => {
-      const bodyText = document.body.innerText;
-
-      // Product name
-      let name = document.title
-        .replace(/\s*-\s*Buy.*$/i, '')
-        .replace(/\s*\|.*$/, '')
-        .replace(/Online at Best.*$/i, '')
-        .replace(/Itm Store Online.*$/i, '')
-        .trim();
-      if (!name || name.length < 3) name = 'N/A';
-
-      // Prices
-      let sellingPrice = 'N/A';
-      let mrp = 'N/A';
-      const priceMatches = bodyText.match(/\u20B9[\d,]+/g);
-      if (priceMatches && priceMatches.length >= 1) {
-        const discountMatch = bodyText.match(/(\d+)%\s*[\n\r]*\u20B9?([\d,]+)\s*[\n\r]*\u20B9([\d,]+)/);
-        if (discountMatch) {
-          mrp = '\u20B9' + discountMatch[2];
-          sellingPrice = '\u20B9' + discountMatch[3];
-        } else {
-          sellingPrice = priceMatches[0];
-          if (priceMatches.length > 1) mrp = priceMatches[0];
-        }
-      }
-
-      // Availability
-      const outOfStock = bodyText.includes('Currently unavailable') ||
-                         bodyText.includes('Sold Out') ||
-                         bodyText.includes('Out of stock') ||
-                         bodyText.includes('coming soon');
-
-      // Delivery
-      let deliveryDate = 'N/A';
-      let deliveryCharge = 'N/A';
-      let notServiceable = false;
-
-      if (bodyText.includes('not serviceable') || bodyText.includes('Cannot be delivered') ||
-          bodyText.includes('not delivered') || bodyText.includes('delivery not available')) {
-        notServiceable = true;
-        deliveryDate = 'Not Serviceable';
-      }
-
-      const delMatch = bodyText.match(/Delivery by[,\s]*([A-Za-z]+[\s,]*(?:[A-Za-z]+\s+)?\d+[^|\n]*)/i) ||
-                       bodyText.match(/Delivered by[,\s]*([A-Za-z]+[\s,]*(?:[A-Za-z]+\s+)?\d+[^|\n]*)/i) ||
-                       bodyText.match(/Get it by[,\s]*([A-Za-z]+[\s,]*(?:[A-Za-z]+\s+)?\d+[^|\n]*)/i);
-      if (delMatch) deliveryDate = delMatch[1].trim().substring(0, 50);
-
-      if (bodyText.includes('FREE Delivery') || bodyText.includes('Free delivery') || bodyText.includes('Free Delivery')) {
-        deliveryCharge = 'FREE';
+      // Get MRP from body text (JSON-LD only has selling price)
+      // Skip AD blocks — find the price section after "Selected Color"
+      const bt = document.body.innerText;
+      const colorIdx = bt.indexOf('Selected Color');
+      const priceText = colorIdx > -1 ? bt.substring(colorIdx) : bt;
+      const dm = priceText.match(/(\d+)%\n([\d,]+)\n\u20B9([\d,]+)/);
+      if (dm) {
+        mrp = '\u20B9' + dm[2];
+        if (sp === 'N/A') sp = '\u20B9' + dm[3];
       } else {
-        const chg = bodyText.match(/\u20B9(\d+)\s*(?:Delivery|delivery|shipping)/);
-        if (chg) deliveryCharge = '\u20B9' + chg[1];
+        const dm2 = priceText.match(/(\d+)%\s*[\n\r]*([\d,]+)\s*[\n\r]*\u20B9([\d,]+)/);
+        if (dm2) {
+          mrp = '\u20B9' + dm2[2];
+          if (sp === 'N/A') sp = '\u20B9' + dm2[3];
+        }
       }
 
-      if (bodyText.includes('Location not set') || bodyText.includes('Select delivery location')) {
-        deliveryDate = 'Pincode not applied';
+      // Fallback: name from body text
+      if (name === 'N/A') {
+        const lines = bt.split('\n').map(l => l.trim()).filter(l => l.length > 10 && l.length < 300);
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].includes('Visit store') && i + 1 < lines.length) { name = lines[i + 1]; break; }
+        }
       }
 
-      let available = !outOfStock && !notServiceable;
-      if (deliveryDate !== 'N/A' && deliveryDate !== 'Not Serviceable' && deliveryDate !== 'Pincode not applied') {
-        available = true;
+      // Availability from body text
+      if (bt.includes('Currently unavailable') || bt.includes('Sold Out') || bt.includes('Out of stock')) {
+        available = false;
       }
 
-      return {
-        name: name.substring(0, 200),
-        mrp, sellingPrice, available,
-        deliveryDate, deliveryCharge
-      };
+      return { name: name.substring(0, 150), mrp, sp, available };
     });
 
-    return data;
+    return info;
   } catch (e) {
-    console.error(`  Error scraping ${fsn}/${pincode}: ${e.message}`);
-    return {
-      name: 'Error', mrp: 'N/A', sellingPrice: 'N/A',
-      available: false, deliveryDate: 'Error', deliveryCharge: 'N/A'
-    };
+    console.error(`  Page load error ${fsn}: ${e.message}`);
+    return { name: 'Error', mrp: 'N/A', sp: 'N/A', available: false };
   }
 }
 
-async function scrapeWithRetry(page, fsn, pincode, retries = MAX_RETRIES) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const result = await scrapeProduct(page, fsn, pincode);
-    if (result.name !== 'Error') return result;
-    if (attempt < retries) {
-      console.log(`  Retry ${attempt + 1} for ${fsn}/${pincode}...`);
-      await delay(3000);
+// Enter/change pincode and extract delivery info (without reloading the page)
+async function checkPincode(page, pincode) {
+  try {
+    // Click delivery location link
+    const links = await page.$$('a, div, span');
+    for (const el of links) {
+      const text = await page.evaluate(e => e.textContent.trim(), el);
+      if (text === 'Select delivery location' || text.includes('Select delivery location')
+          || text === 'Change' || text.includes('Enter pincode')) {
+        await el.click();
+        await delay(1000);
+        break;
+      }
     }
+
+    // Find and fill pincode input
+    const allInputs = await page.$$('input');
+    for (const inp of allInputs) {
+      const ph = await page.evaluate(e => e.placeholder, inp);
+      if (ph && (ph.toLowerCase().includes('pincode') || ph.toLowerCase().includes('pin code') || ph.includes('Enter'))) {
+        await inp.click({ clickCount: 3 });
+        await inp.type(pincode, { delay: 20 });
+        await delay(300);
+        const btns = await page.$$('button, span');
+        for (const b of btns) {
+          const t = await page.evaluate(e => e.textContent.trim(), b);
+          if (t === 'Apply' || t === 'Check' || t === 'Submit') { await b.click(); break; }
+        }
+        await delay(2000);
+        break;
+      }
+    }
+
+    // Extract delivery info
+    const delivery = await page.evaluate(() => {
+      const bt = document.body.innerText;
+      if (bt.includes('not serviceable') || bt.includes('Cannot be delivered') || bt.includes('delivery not available')) {
+        return { dd: 'Not Serviceable', available: false };
+      }
+      let dd = 'N/A';
+      const patterns = [
+        /Delivery\s*\n\s*by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Delivery\s+by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Delivered\s+by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Get it by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Delivery in\s+(\d+\s+\w+)/i
+      ];
+      for (const p of patterns) {
+        const m = bt.match(p);
+        if (m) { dd = m[1].trim().replace(/,?\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i, ''); break; }
+      }
+      const oos = bt.includes('Currently unavailable') || bt.includes('Sold Out') || bt.includes('Out of stock');
+      return { dd, available: !oos };
+    });
+
+    return delivery;
+  } catch (e) {
+    return { dd: 'Error', available: false };
   }
-  return { name: 'Error', mrp: 'N/A', sellingPrice: 'N/A', available: false, deliveryDate: 'Error', deliveryCharge: 'N/A' };
 }
 
 // ─── MAIN ───────────────────────────────────────────────────
@@ -355,7 +330,7 @@ async function main() {
   }
 
   console.log(`FSNs to process: ${fsns.length}`);
-  console.log(`Estimated time: ~${Math.ceil(fsns.length * 15 / 60)} minutes`);
+  console.log(`Estimated time: ~${Math.ceil(fsns.length * 0.2)} minutes`);
   console.log(`Pincodes: ${CITY_NAMES.join(', ')}`);
 
   // Get Sheets API token (service account)
@@ -400,7 +375,7 @@ async function main() {
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     const type = req.resourceType();
-    if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
+    if (['image', 'font', 'media'].includes(type)) {
       req.abort();
     } else {
       req.continue();
@@ -416,6 +391,28 @@ async function main() {
     sheetRowOffset = 2 + (opts.chunk * chunkSize);
   }
 
+  // Write sheet headers
+  if (token) {
+    const headers = [
+      'FSN', 'Product Name', 'MRP', 'Selling Price',
+      'Delhi Stock', 'Delhi Delivery',
+      'Bangalore Stock', 'Bangalore Delivery',
+      'Mumbai Stock', 'Mumbai Delivery',
+      'Pune Stock', 'Pune Delivery',
+      'Last Checked'
+    ];
+    try {
+      const hRange = 'Tracker!A1:M1';
+      await sheetsAPI('PUT',
+        `/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(hRange)}?valueInputOption=RAW`,
+        { range: hRange, values: [headers] }, token
+      );
+      console.log('Sheet headers written');
+    } catch (e) {
+      console.error('Could not write headers:', e.message);
+    }
+  }
+
   const batchBuffer = [];
   let processed = 0;
   let errors = 0;
@@ -425,28 +422,26 @@ async function main() {
     const elapsed = ((Date.now() - startTime) / 60000).toFixed(1);
     console.log(`[${i + 1}/${fsns.length}] ${fsn} (${elapsed}m elapsed)`);
 
-    const row = [fsn];
-    let productName = 'N/A', mrp = 'N/A', sellingPrice = 'N/A';
+    // Load page ONCE per FSN — extract product info from JSON-LD
+    const info = await loadProductPage(page, fsn);
+    const row = [fsn, info.name, info.mrp, info.sp];
 
+    if (info.name === 'Error') errors++;
+
+    // Check each pincode WITHOUT reloading the page
     for (let p = 0; p < PINCODES.length; p++) {
-      const data = await scrapeWithRetry(page, fsn, PINCODES[p]);
-
-      if (p === 0) {
-        productName = data.name;
-        mrp = data.mrp;
-        sellingPrice = data.sellingPrice;
-        row.push(productName, mrp, sellingPrice);
+      let delivery;
+      try {
+        delivery = await checkPincode(page, PINCODES[p]);
+      } catch (e) {
+        delivery = { dd: 'Error', available: false };
+        errors++;
       }
 
-      row.push(
-        data.available ? 'In Stock' : 'Out of Stock',
-        data.deliveryDate,
-        data.deliveryCharge
-      );
+      const inStock = info.available && delivery.available;
+      row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
 
-      if (data.name === 'Error') errors++;
-
-      console.log(`  ${CITY_NAMES[p]} (${PINCODES[p]}): ${data.available ? 'In Stock' : 'Out of Stock'} | ${data.deliveryDate} | ${data.deliveryCharge}`);
+      console.log(`  ${CITY_NAMES[p]} (${PINCODES[p]}): ${inStock ? 'In Stock' : 'OOS'} | Del: ${delivery.dd}`);
     }
 
     // Add timestamp
@@ -473,6 +468,9 @@ async function main() {
       }
       batchBuffer.length = 0;
     }
+
+    // Small delay between FSNs
+    if (i < fsns.length - 1) await delay(500);
   }
 
   await browser.close();

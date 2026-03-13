@@ -164,7 +164,7 @@ function sheetsRequest(method, apiPath, body, token) {
 
 async function writeBatchToSheet(rows, startRow, token) {
   const endRow = startRow + rows.length - 1;
-  const range = `Tracker!A${startRow}:R${endRow}`;
+  const range = `Tracker!A${startRow}:M${endRow}`;
   const encodedRange = encodeURIComponent(range);
   const apiPath = `/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodedRange}?valueInputOption=RAW`;
 
@@ -176,7 +176,7 @@ async function writeBatchToSheet(rows, startRow, token) {
     logError(`Sheet write failed for rows ${startRow}-${endRow}`, e);
     // Try refreshing token and retry once
     try {
-      const newToken = await refreshAccessToken(readClaspTokens());
+      const newToken = await getAccessToken();
       await sheetsRequest('PUT', apiPath, { range, values: rows }, newToken);
       log(`  >> Sheet: wrote rows ${startRow}-${endRow} (after token refresh)`);
       return true;
@@ -190,13 +190,13 @@ async function writeBatchToSheet(rows, startRow, token) {
 async function setupSheetHeaders(token) {
   const headers = [
     'FSN', 'Product Name', 'MRP', 'Selling Price',
-    'Delhi Stock', 'Delhi Delivery', 'Delhi Del. Cost',
-    'Bangalore Stock', 'Bangalore Delivery', 'Bangalore Del. Cost',
-    'Mumbai Stock', 'Mumbai Delivery', 'Mumbai Del. Cost',
-    'Pune Stock', 'Pune Delivery', 'Pune Del. Cost',
+    'Delhi Stock', 'Delhi Delivery',
+    'Bangalore Stock', 'Bangalore Delivery',
+    'Mumbai Stock', 'Mumbai Delivery',
+    'Pune Stock', 'Pune Delivery',
     'Last Checked'
   ];
-  const range = 'Tracker!A1:Q1';
+  const range = `Tracker!A1:M1`;
   const encodedRange = encodeURIComponent(range);
   try {
     await sheetsRequest('PUT',
@@ -209,12 +209,13 @@ async function setupSheetHeaders(token) {
   }
 }
 
-// ─── FLIPKART SCRAPER (tested & confirmed working) ─────────────────────────
-async function scrapeProduct(page, fsn, pincode) {
+// ─── FLIPKART SCRAPER ────────────────────────────────────────────────────────
+
+// Load a product page once, extract product info (name, MRP, SP) from JSON-LD
+async function loadProductPage(page, fsn) {
   try {
-    const url = `https://www.flipkart.com/product/p/itm?pid=${fsn}`;
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 45000 });
-    await delay(2500);
+    await page.goto(`https://www.flipkart.com/product/p/itm?pid=${fsn}`, { waitUntil: 'networkidle2', timeout: 45000 });
+    await delay(1500);
 
     // Close login popup
     try {
@@ -224,104 +225,133 @@ async function scrapeProduct(page, fsn, pincode) {
         if (t.includes('\u2715')) { await b.click(); break; }
       }
     } catch (e) {}
-    await delay(500);
+    await delay(300);
 
-    // Click "Select delivery location" to open pincode popup
-    try {
-      const links = await page.$$('a, div, span');
-      for (const el of links) {
-        const text = await page.evaluate(e => e.textContent.trim(), el);
-        if (text === 'Select delivery location' || text === 'Location not setSelect delivery location') {
-          await el.click();
-          await delay(2000);
-          break;
-        }
-      }
+    // Extract product info from JSON-LD structured data (most reliable)
+    const info = await page.evaluate(() => {
+      let name = 'N/A', mrp = 'N/A', sp = 'N/A', available = true;
 
-      // Find pincode input in popup
-      const allInputs = await page.$$('input');
-      for (const inp of allInputs) {
-        const ph = await page.evaluate(e => e.placeholder, inp);
-        if (ph && (ph.toLowerCase().includes('pincode') || ph.toLowerCase().includes('pin code') || ph.includes('Enter'))) {
-          await inp.click({ clickCount: 3 });
-          await inp.type(pincode, { delay: 30 });
-          await delay(500);
-          const btns2 = await page.$$('button, span');
-          for (const b of btns2) {
-            const t = await page.evaluate(e => e.textContent.trim(), b);
-            if (t === 'Apply' || t === 'Check' || t === 'Submit') { await b.click(); break; }
+      // Try JSON-LD first
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      for (const s of scripts) {
+        try {
+          const data = JSON.parse(s.textContent);
+          const product = Array.isArray(data) ? data[0] : data;
+          if (product['@type'] === 'Product' && product.name) {
+            name = product.name;
+            if (product.offers) {
+              const offer = product.offers;
+              if (offer.price) sp = '\u20B9' + Number(offer.price).toLocaleString('en-IN');
+              if (offer.availability && offer.availability.includes('OutOfStock')) available = false;
+            }
+            break;
           }
-          await delay(3000);
-          break;
-        }
+        } catch (e) {}
       }
-    } catch (e) {
-      log(`  Pincode entry issue for ${fsn}/${pincode}: ${e.message}`);
-    }
 
-    // Extract data
-    const data = await page.evaluate(() => {
+      // Get MRP from body text (JSON-LD only has selling price)
+      // Skip AD blocks — find the price section after "Selected Color" or brand name
       const bt = document.body.innerText;
-
-      // Product name
-      let name = 'N/A';
-      const lines = bt.split('\n').map(l => l.trim()).filter(l => l.length > 10 && l.length < 300);
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].includes('Visit store') && i + 1 < lines.length) {
-          name = lines[i + 1];
-          break;
-        }
-      }
-      // Fallback: title-based selectors
-      if (name === 'N/A') {
-        const titleEl = document.querySelector('[class*="VU-ZEz"]') || document.querySelector('[class*="G6XhRU"]');
-        if (titleEl) name = titleEl.textContent.trim();
-      }
-
-      // Price
-      let sp = 'N/A', mrp = 'N/A';
-      const dm = bt.match(/(\d+)%\n([\d,]+)\n\u20B9([\d,]+)/);
+      const colorIdx = bt.indexOf('Selected Color');
+      const priceText = colorIdx > -1 ? bt.substring(colorIdx) : bt;
+      const dm = priceText.match(/(\d+)%\n([\d,]+)\n\u20B9([\d,]+)/);
       if (dm) {
         mrp = '\u20B9' + dm[2];
-        sp = '\u20B9' + dm[3];
+        if (sp === 'N/A') sp = '\u20B9' + dm[3];
       } else {
-        const dm2 = bt.match(/(\d+)%\s*[\n\r]*([\d,]+)\s*[\n\r]*\u20B9([\d,]+)/);
+        const dm2 = priceText.match(/(\d+)%\s*[\n\r]*([\d,]+)\s*[\n\r]*\u20B9([\d,]+)/);
         if (dm2) {
           mrp = '\u20B9' + dm2[2];
-          sp = '\u20B9' + dm2[3];
-        } else {
-          const pm = bt.match(/\u20B9([\d,]+)/);
-          if (pm) sp = '\u20B9' + pm[1];
+          if (sp === 'N/A') sp = '\u20B9' + dm2[3];
         }
       }
 
-      // Availability
-      const oos = bt.includes('Currently unavailable') || bt.includes('Sold Out') || bt.includes('Out of stock');
-
-      // Delivery info
-      let dd = 'N/A', dc = 'N/A';
-      const dlm = bt.match(/Delivery\s*by\s+(\d+\s+\w+(?:,\s*\w+)?)/i) ||
-                  bt.match(/Delivered\s*by\s+(\d+\s+\w+(?:,\s*\w+)?)/i) ||
-                  bt.match(/Get it by\s+(\d+\s+\w+)/i);
-      if (dlm) dd = dlm[1].trim();
-
-      if (bt.includes('not serviceable') || bt.includes('Cannot be delivered')) {
-        dd = 'Not Serviceable';
-      }
-      if (bt.includes('FREE Delivery') || bt.includes('Free Delivery') || bt.includes('Free delivery')) {
-        dc = 'FREE';
-      } else {
-        const c = bt.match(/\u20B9(\d+)\s*delivery/i);
-        if (c) dc = '\u20B9' + c[1];
+      // Fallback: name from body text
+      if (name === 'N/A') {
+        const lines = bt.split('\n').map(l => l.trim()).filter(l => l.length > 10 && l.length < 300);
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].includes('Visit store') && i + 1 < lines.length) { name = lines[i + 1]; break; }
+        }
       }
 
-      return { name: name.substring(0, 150), mrp, sp, available: !oos, dd, dc };
+      // Availability from body text
+      if (bt.includes('Currently unavailable') || bt.includes('Sold Out') || bt.includes('Out of stock')) {
+        available = false;
+      }
+
+      return { name: name.substring(0, 150), mrp, sp, available };
     });
 
-    return data;
+    return info;
   } catch (e) {
-    logError(`Scrape error ${fsn}/${pincode}`, e);
-    return { name: 'Error', mrp: 'N/A', sp: 'N/A', available: false, dd: 'Error', dc: 'N/A' };
+    logError(`Page load error ${fsn}`, e);
+    return { name: 'Error', mrp: 'N/A', sp: 'N/A', available: false };
+  }
+}
+
+// Enter/change pincode and extract delivery info (without reloading the page)
+async function checkPincode(page, pincode) {
+  try {
+    // Click delivery location link or the existing pincode display
+    const links = await page.$$('a, div, span');
+    for (const el of links) {
+      const text = await page.evaluate(e => e.textContent.trim(), el);
+      if (text === 'Select delivery location' || text.includes('Select delivery location')
+          || text === 'Change' || text.includes('Enter pincode')) {
+        await el.click();
+        await delay(1000);
+        break;
+      }
+    }
+
+    // Find and fill pincode input
+    const allInputs = await page.$$('input');
+    for (const inp of allInputs) {
+      const ph = await page.evaluate(e => e.placeholder, inp);
+      if (ph && (ph.toLowerCase().includes('pincode') || ph.toLowerCase().includes('pin code') || ph.includes('Enter'))) {
+        await inp.click({ clickCount: 3 });
+        await inp.type(pincode, { delay: 20 });
+        await delay(300);
+        const btns = await page.$$('button, span');
+        for (const b of btns) {
+          const t = await page.evaluate(e => e.textContent.trim(), b);
+          if (t === 'Apply' || t === 'Check' || t === 'Submit') { await b.click(); break; }
+        }
+        await delay(2000);
+        break;
+      }
+    }
+
+    // Extract delivery info from body text
+    const delivery = await page.evaluate(() => {
+      const bt = document.body.innerText;
+      let dd = 'N/A';
+
+      // Check not serviceable first
+      if (bt.includes('not serviceable') || bt.includes('Cannot be delivered') || bt.includes('delivery not available')) {
+        return { dd: 'Not Serviceable', available: false };
+      }
+
+      // Delivery date patterns
+      const patterns = [
+        /Delivery\s*\n\s*by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Delivery\s+by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Delivered\s+by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Get it by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Delivery in\s+(\d+\s+\w+)/i
+      ];
+      for (const p of patterns) {
+        const m = bt.match(p);
+        if (m) { dd = m[1].trim().replace(/,?\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i, ''); break; }
+      }
+
+      const oos = bt.includes('Currently unavailable') || bt.includes('Sold Out') || bt.includes('Out of stock');
+      return { dd, available: !oos };
+    });
+
+    return delivery;
+  } catch (e) {
+    return { dd: 'Error', available: false };
   }
 }
 
@@ -378,7 +408,7 @@ async function main() {
   const csvFile = path.join(CSV_DIR, `flipkart_${dateStr}.csv`);
   const csvHeaders = [
     'FSN', 'Product Name', 'MRP', 'Selling Price',
-    ...CITY_NAMES.flatMap(c => [`${c} Stock`, `${c} Delivery`, `${c} Del. Cost`]),
+    ...CITY_NAMES.flatMap(c => [`${c} Stock`, `${c} Delivery`]),
     'Last Checked'
   ];
   fs.writeFileSync(csvFile, csvHeaders.map(escapeCSV).join(',') + '\n', 'utf8');
@@ -433,40 +463,26 @@ async function main() {
     const fsn = fsns[i];
     log(`[${i + 1}/${fsns.length}] Processing FSN: ${fsn}`);
 
-    const row = [fsn];
-    let productName = 'N/A';
+    // Load page ONCE per FSN — extract product info from JSON-LD
+    const info = await loadProductPage(page, fsn);
+    const row = [fsn, info.name, info.mrp, info.sp];
 
+    // Check each pincode WITHOUT reloading the page
     for (let p = 0; p < PINCODES.length; p++) {
-      let retries = 2;
-      let data = null;
-      while (retries > 0) {
-        try {
-          data = await scrapeProduct(page, fsn, PINCODES[p]);
-          break;
-        } catch (e) {
-          retries--;
-          logError(`  Retry remaining: ${retries} for ${fsn}/${PINCODES[p]}`, e);
-          if (retries > 0) await delay(3000);
-        }
-      }
-      if (!data) {
-        data = { name: 'Error', mrp: 'N/A', sp: 'N/A', available: false, dd: 'Error', dc: 'N/A' };
+      let delivery;
+      try {
+        delivery = await checkPincode(page, PINCODES[p]);
+      } catch (e) {
+        logError(`  Pincode error ${fsn}/${PINCODES[p]}`, e);
+        delivery = { dd: 'Error', available: false };
         totalErrors++;
       }
 
-      // Use product info from first pincode
-      if (p === 0) {
-        productName = data.name;
-        row.push(productName, data.mrp, data.sp);
-      }
+      // Use page-level availability combined with pincode-level
+      const inStock = info.available && delivery.available;
+      row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
 
-      row.push(
-        data.available ? 'In Stock' : 'Out of Stock',
-        data.dd,
-        data.dc
-      );
-
-      log(`  ${CITY_NAMES[p]} (${PINCODES[p]}): ${data.available ? 'In Stock' : 'OOS'} | Del: ${data.dd} | Cost: ${data.dc}`);
+      log(`  ${CITY_NAMES[p]} (${PINCODES[p]}): ${inStock ? 'In Stock' : 'OOS'} | Del: ${delivery.dd}`);
     }
 
     // Add timestamp
@@ -482,7 +498,6 @@ async function main() {
     // Write to Google Sheet in batches of BATCH_SIZE or at the end
     if (sheetsEnabled && (batchRows.length >= BATCH_SIZE || i === fsns.length - 1)) {
       try {
-        // Refresh token if needed
         token = await getAccessToken();
         const success = await writeBatchToSheet(batchRows, sheetRowCursor, token);
         if (success) {
@@ -496,9 +511,9 @@ async function main() {
       batchRows = [];
     }
 
-    // Small delay between FSNs to be polite
+    // Small delay between FSNs
     if (i < fsns.length - 1) {
-      await delay(1000);
+      await delay(500);
     }
   }
 
