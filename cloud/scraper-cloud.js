@@ -416,6 +416,7 @@ async function main() {
   const batchBuffer = [];
   let processed = 0;
   let errors = 0;
+  let consecutiveErrors = 0;
 
   for (let i = 0; i < fsns.length; i++) {
     const fsn = fsns[i];
@@ -423,10 +424,31 @@ async function main() {
     console.log(`[${i + 1}/${fsns.length}] ${fsn} (${elapsed}m elapsed)`);
 
     // Load page ONCE per FSN — extract product info from JSON-LD
-    const info = await loadProductPage(page, fsn);
+    let info = await loadProductPage(page, fsn);
+
+    // Retry once on error with a longer delay
+    if (info.name === 'Error') {
+      console.log(`  Retrying ${fsn} after 5s...`);
+      await delay(5000);
+      info = await loadProductPage(page, fsn);
+    }
+
     const row = [fsn, info.name, info.mrp, info.sp];
 
-    if (info.name === 'Error') errors++;
+    if (info.name === 'Error') {
+      errors++;
+      consecutiveErrors++;
+      // Backoff: if many consecutive errors, Flipkart is likely blocking this IP
+      if (consecutiveErrors >= 5) {
+        console.log(`  >> ${consecutiveErrors} consecutive errors — pausing 60s to avoid IP block`);
+        await delay(60000);
+      } else if (consecutiveErrors >= 3) {
+        console.log(`  >> ${consecutiveErrors} consecutive errors — pausing 30s`);
+        await delay(30000);
+      }
+    } else {
+      consecutiveErrors = 0;
+    }
 
     // Check each pincode WITHOUT reloading the page
     for (let p = 0; p < PINCODES.length; p++) {
@@ -469,8 +491,8 @@ async function main() {
       batchBuffer.length = 0;
     }
 
-    // Small delay between FSNs
-    if (i < fsns.length - 1) await delay(500);
+    // Delay between FSNs (1.5s to be less aggressive)
+    if (i < fsns.length - 1) await delay(1500);
   }
 
   await browser.close();
