@@ -16,6 +16,7 @@ const PINCODES = ['110001', '560001', '400098', '411045'];
 const CITY_NAMES = ['Delhi', 'Bangalore', 'Mumbai', 'Pune'];
 const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const FSN_FILE = path.join(__dirname, 'FSN_LIST.txt');
+const FSN_CAT_FILE = path.join(__dirname, 'FSN_CATEGORIES.csv');
 const BATCH_SIZE = 10;
 const HEADLESS = true;
 const LOG_DIR = path.join(__dirname, 'logs');
@@ -209,6 +210,103 @@ async function setupSheetHeaders(token) {
   }
 }
 
+// ─── CATEGORY HELPERS ────────────────────────────────────────────────────────
+
+function prettifyCategory(cat) {
+  return cat.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+function loadFSNCategories() {
+  if (!fs.existsSync(FSN_CAT_FILE)) return null;
+  const lines = fs.readFileSync(FSN_CAT_FILE, 'utf8').trim().split('\n');
+  const map = {};
+  const catFSNs = {};
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(',');
+    if (parts.length >= 2) {
+      const fsn = parts[0].trim();
+      const tabName = prettifyCategory(parts[1].trim());
+      map[fsn] = tabName;
+      if (!catFSNs[tabName]) catFSNs[tabName] = [];
+      catFSNs[tabName].push(fsn);
+    }
+  }
+  return { map, catFSNs };
+}
+
+async function ensureCategoryTabs(catNames, token) {
+  const meta = await sheetsRequest('GET',
+    `/v4/spreadsheets/${SPREADSHEET_ID}?fields=sheets.properties.title`,
+    null, token
+  );
+  const existing = new Set((meta.sheets || []).map(s => s.properties.title));
+  const toCreate = catNames.filter(n => !existing.has(n));
+  if (toCreate.length > 0) {
+    const requests = toCreate.map(title => ({
+      addSheet: { properties: { title } }
+    }));
+    await sheetsRequest('POST',
+      `/v4/spreadsheets/${SPREADSHEET_ID}:batchUpdate`,
+      { requests }, token
+    );
+    log(`Created ${toCreate.length} category tabs: ${toCreate.join(', ')}`);
+  }
+
+  const headers = [
+    'FSN', 'Product Name', 'MRP', 'Selling Price',
+    'Delhi Stock', 'Delhi Delivery', 'Bangalore Stock', 'Bangalore Delivery',
+    'Mumbai Stock', 'Mumbai Delivery', 'Pune Stock', 'Pune Delivery', 'Last Checked'
+  ];
+  const headerData = catNames.map(tab => ({
+    range: `'${tab}'!A1:M1`, values: [headers]
+  }));
+  headerData.push({ range: 'Tracker!A1:M1', values: [headers] });
+  await sheetsRequest('POST',
+    `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+    { valueInputOption: 'RAW', data: headerData }, token
+  );
+  log('Headers written to all tabs');
+}
+
+async function addRedFormatting(token) {
+  const meta = await sheetsRequest('GET',
+    `/v4/spreadsheets/${SPREADSHEET_ID}?fields=sheets.properties`,
+    null, token
+  );
+  const sheets = (meta.sheets || []).map(s => s.properties);
+  const stockCols = [4, 6, 8, 10];
+  const requests = [];
+  for (const sheet of sheets) {
+    for (const col of stockCols) {
+      requests.push({
+        addConditionalFormatRule: {
+          rule: {
+            ranges: [{
+              sheetId: sheet.sheetId, startRowIndex: 1,
+              startColumnIndex: col, endColumnIndex: col + 1
+            }],
+            booleanRule: {
+              condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Out of Stock' }] },
+              format: {
+                backgroundColor: { red: 1, green: 0.8, blue: 0.8 },
+                textFormat: { foregroundColor: { red: 0.8, green: 0, blue: 0 }, bold: true }
+              }
+            }
+          },
+          index: 0
+        }
+      });
+    }
+  }
+  if (requests.length > 0) {
+    await sheetsRequest('POST',
+      `/v4/spreadsheets/${SPREADSHEET_ID}:batchUpdate`,
+      { requests }, token
+    );
+    log(`Red formatting applied to ${sheets.length} tabs`);
+  }
+}
+
 // ─── FLIPKART SCRAPER ────────────────────────────────────────────────────────
 
 // Load a product page once, extract product info (name, MRP, SP) from JSON-LD
@@ -388,6 +486,16 @@ async function main() {
   log(`FSNs to process: ${fsns.length}`);
   log(`Pincodes: ${CITY_NAMES.map((c, i) => c + ' (' + PINCODES[i] + ')').join(', ')}`);
 
+  // Load category mapping
+  const catData = loadFSNCategories();
+  const useCategories = !!catData;
+  if (useCategories) {
+    const catNames = Object.keys(catData.catFSNs);
+    log(`Categories loaded: ${catNames.length} (${Object.keys(catData.map).length} FSN mappings)`);
+  } else {
+    log('No FSN_CATEGORIES.csv found — writing to Tracker tab only');
+  }
+
   // Get Google Sheets token
   let token = null;
   let sheetsEnabled = false;
@@ -399,10 +507,24 @@ async function main() {
     logError('Google Sheets auth failed - will save CSV only', e);
   }
 
-  // Write sheet headers if authenticated
-  if (sheetsEnabled) {
+  // Setup category tabs + red formatting, or fallback to Tracker headers
+  if (sheetsEnabled && useCategories) {
+    try {
+      await ensureCategoryTabs(Object.keys(catData.catFSNs), token);
+      await addRedFormatting(token);
+    } catch (e) {
+      logError('Tab setup error', e);
+    }
+  } else if (sheetsEnabled) {
     await setupSheetHeaders(token);
   }
+
+  // Per-category row counters (local scraper has no chunking, all start at row 2)
+  const catRowCounters = {};
+  if (useCategories) {
+    for (const tab of Object.keys(catData.catFSNs)) catRowCounters[tab] = 2;
+  }
+  let trackerRow = 2;
 
   // Prepare CSV file
   const csvFile = path.join(CSV_DIR, `flipkart_${dateStr}.csv`);
@@ -454,10 +576,9 @@ async function main() {
   });
 
   // Processing loop
-  let batchRows = [];
+  let pendingWrites = [];
   let totalProcessed = 0;
   let totalErrors = 0;
-  let sheetRowCursor = 2; // row 1 = header, data starts at row 2
 
   for (let i = 0; i < fsns.length; i++) {
     const fsn = fsns[i];
@@ -478,10 +599,8 @@ async function main() {
         totalErrors++;
       }
 
-      // Use page-level availability combined with pincode-level
       const inStock = info.available && delivery.available;
       row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
-
       log(`  ${CITY_NAMES[p]} (${PINCODES[p]}): ${inStock ? 'In Stock' : 'OOS'} | Del: ${delivery.dd}`);
     }
 
@@ -491,24 +610,41 @@ async function main() {
 
     // Append to CSV immediately
     fs.appendFileSync(csvFile, row.map(escapeCSV).join(',') + '\n', 'utf8');
-
-    batchRows.push(row);
     totalProcessed++;
 
-    // Write to Google Sheet in batches of BATCH_SIZE or at the end
-    if (sheetsEnabled && (batchRows.length >= BATCH_SIZE || i === fsns.length - 1)) {
-      try {
-        token = await getAccessToken();
-        const success = await writeBatchToSheet(batchRows, sheetRowCursor, token);
-        if (success) {
-          sheetRowCursor += batchRows.length;
-        } else {
-          log('  >> Sheet write failed, data saved in CSV');
+    // Queue writes: Tracker tab + category tab
+    if (sheetsEnabled) {
+      pendingWrites.push({
+        range: `Tracker!A${trackerRow}:M${trackerRow}`,
+        values: [row]
+      });
+      trackerRow++;
+
+      if (useCategories) {
+        const catTab = catData.map[fsn];
+        if (catTab && catRowCounters[catTab] !== undefined) {
+          pendingWrites.push({
+            range: `'${catTab}'!A${catRowCounters[catTab]}:M${catRowCounters[catTab]}`,
+            values: [row]
+          });
+          catRowCounters[catTab]++;
         }
-      } catch (e) {
-        logError('Batch sheet write error', e);
       }
-      batchRows = [];
+
+      // Flush batch every BATCH_SIZE FSNs or at the end
+      if (pendingWrites.length >= BATCH_SIZE * 2 || i === fsns.length - 1) {
+        try {
+          token = await getAccessToken();
+          await sheetsRequest('POST',
+            `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+            { valueInputOption: 'RAW', data: pendingWrites }, token
+          );
+          log(`  >> Flushed ${pendingWrites.length} ranges to Google Sheet`);
+        } catch (e) {
+          logError('Batch sheet write error', e);
+        }
+        pendingWrites = [];
+      }
     }
 
     // Small delay between FSNs

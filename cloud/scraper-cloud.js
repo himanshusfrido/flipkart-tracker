@@ -25,7 +25,8 @@ const SPREADSHEET_ID = '1QKqHqi8iB_pDsYHxuKtCLzfiQfXa--aXHb_NNcqSK0A';
 const PINCODES = ['110001', '560001', '400098', '411045'];
 const CITY_NAMES = ['Delhi', 'Bangalore', 'Mumbai', 'Pune'];
 const FSN_FILE = path.join(__dirname, '..', 'FSN_LIST.txt');
-const BATCH_SIZE = 10; // Write to Google Sheet every N FSNs
+const FSN_CAT_FILE = path.join(__dirname, '..', 'FSN_CATEGORIES.csv');
+const BATCH_SIZE = 10;
 const PAGE_TIMEOUT = 45000;
 
 // ─── PARSE CLI ARGS ─────────────────────────────────────────
@@ -155,15 +156,132 @@ function sheetsAPI(method, apiPath, body, token) {
   });
 }
 
-async function writeToSheet(rows, startRow, token) {
+async function writeToSheet(tabName, rows, startRow, token) {
   const endRow = startRow + rows.length - 1;
-  const range = `Tracker!A${startRow}:M${endRow}`;
+  const range = `'${tabName}'!A${startRow}:M${endRow}`;
   await sheetsAPI('PUT',
     `/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=RAW`,
     { range, values: rows },
     token
   );
   return endRow;
+}
+
+// ─── CATEGORY HELPERS ──────────────────────────────────────
+
+function prettifyCategory(cat) {
+  return cat.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+}
+
+function loadFSNCategories() {
+  if (!fs.existsSync(FSN_CAT_FILE)) return null;
+  const lines = fs.readFileSync(FSN_CAT_FILE, 'utf8').trim().split('\n');
+  const map = {}; // fsn -> category tab name
+  const catFSNs = {}; // tab name -> [fsn, ...]
+  for (let i = 1; i < lines.length; i++) { // skip header
+    const parts = lines[i].split(',');
+    if (parts.length >= 2) {
+      const fsn = parts[0].trim();
+      const tabName = prettifyCategory(parts[1].trim());
+      map[fsn] = tabName;
+      if (!catFSNs[tabName]) catFSNs[tabName] = [];
+      catFSNs[tabName].push(fsn);
+    }
+  }
+  return { map, catFSNs };
+}
+
+async function ensureCategoryTabs(catNames, token) {
+  // Get existing sheet tabs
+  const meta = await sheetsAPI('GET',
+    `/v4/spreadsheets/${SPREADSHEET_ID}?fields=sheets.properties.title`,
+    null, token
+  );
+  const existing = new Set((meta.sheets || []).map(s => s.properties.title));
+
+  // Create missing tabs
+  const toCreate = catNames.filter(n => !existing.has(n));
+  if (toCreate.length > 0) {
+    const requests = toCreate.map(title => ({
+      addSheet: { properties: { title } }
+    }));
+    await sheetsAPI('POST',
+      `/v4/spreadsheets/${SPREADSHEET_ID}:batchUpdate`,
+      { requests }, token
+    );
+    console.log(`Created ${toCreate.length} category tabs: ${toCreate.join(', ')}`);
+  }
+
+  // Write headers to all category tabs
+  const headers = [
+    'FSN', 'Product Name', 'MRP', 'Selling Price',
+    'Delhi Stock', 'Delhi Delivery',
+    'Bangalore Stock', 'Bangalore Delivery',
+    'Mumbai Stock', 'Mumbai Delivery',
+    'Pune Stock', 'Pune Delivery',
+    'Last Checked'
+  ];
+  const headerData = catNames.map(tab => ({
+    range: `'${tab}'!A1:M1`,
+    values: [headers]
+  }));
+  // Also write to Tracker tab
+  headerData.push({ range: 'Tracker!A1:M1', values: [headers] });
+
+  await sheetsAPI('POST',
+    `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+    { valueInputOption: 'RAW', data: headerData }, token
+  );
+  console.log('Headers written to all tabs');
+}
+
+async function addRedFormatting(token) {
+  // Get all sheet IDs
+  const meta = await sheetsAPI('GET',
+    `/v4/spreadsheets/${SPREADSHEET_ID}?fields=sheets.properties`,
+    null, token
+  );
+  const sheets = (meta.sheets || []).map(s => s.properties);
+
+  // Stock columns: E(4), G(6), I(8), K(10) — 0-indexed
+  const stockCols = [4, 6, 8, 10];
+  const requests = [];
+
+  for (const sheet of sheets) {
+    for (const col of stockCols) {
+      requests.push({
+        addConditionalFormatRule: {
+          rule: {
+            ranges: [{
+              sheetId: sheet.sheetId,
+              startRowIndex: 1,
+              startColumnIndex: col,
+              endColumnIndex: col + 1
+            }],
+            booleanRule: {
+              condition: {
+                type: 'TEXT_EQ',
+                values: [{ userEnteredValue: 'Out of Stock' }]
+              },
+              format: {
+                backgroundColor: { red: 1, green: 0.8, blue: 0.8 },
+                textFormat: { foregroundColor: { red: 0.8, green: 0, blue: 0 }, bold: true }
+              }
+            }
+          },
+          index: 0
+        }
+      });
+    }
+  }
+
+  if (requests.length > 0) {
+    await sheetsAPI('POST',
+      `/v4/spreadsheets/${SPREADSHEET_ID}:batchUpdate`,
+      { requests }, token
+    );
+    console.log(`Red formatting applied to ${sheets.length} tabs`);
+  }
 }
 
 // ─── FLIPKART SCRAPER ──────────────────────────────────────
@@ -316,21 +434,32 @@ async function main() {
   console.log(`Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
   console.log(`Environment: ${process.env.GITHUB_ACTIONS ? 'GitHub Actions' : 'Local'}`);
 
-  // Load FSNs
-  let fsns = fs.readFileSync(FSN_FILE, 'utf8').trim().split('\n').map(f => f.trim()).filter(Boolean);
-  console.log(`Total FSNs in file: ${fsns.length}`);
+  // Load ALL FSNs (needed for chunk offset calculation)
+  const allFSNs = fs.readFileSync(FSN_FILE, 'utf8').trim().split('\n').map(f => f.trim()).filter(Boolean);
+  console.log(`Total FSNs in file: ${allFSNs.length}`);
 
-  // If running as a chunk (parallel matrix job), slice the FSN list
+  // Load category mapping
+  const catData = loadFSNCategories();
+  const useCategories = !!catData;
+  if (useCategories) {
+    const catNames = Object.keys(catData.catFSNs);
+    console.log(`Categories loaded: ${catNames.length} (${Object.keys(catData.map).length} FSN mappings)`);
+  } else {
+    console.log('No FSN_CATEGORIES.csv found — writing to Tracker tab only');
+  }
+
+  // Determine which FSNs this chunk processes
+  let fsns = allFSNs;
+  let chunkStart = 0;
   if (opts.chunk !== null && opts.totalChunks !== null) {
-    const chunkSize = Math.ceil(fsns.length / opts.totalChunks);
-    const start = opts.chunk * chunkSize;
-    const end = Math.min(start + chunkSize, fsns.length);
-    fsns = fsns.slice(start, end);
-    console.log(`Chunk ${opts.chunk + 1}/${opts.totalChunks}: FSNs ${start + 1}-${end} (${fsns.length} items)`);
+    const chunkSize = Math.ceil(allFSNs.length / opts.totalChunks);
+    chunkStart = opts.chunk * chunkSize;
+    const end = Math.min(chunkStart + chunkSize, allFSNs.length);
+    fsns = allFSNs.slice(chunkStart, end);
+    console.log(`Chunk ${opts.chunk + 1}/${opts.totalChunks}: FSNs ${chunkStart + 1}-${end} (${fsns.length} items)`);
   }
 
   console.log(`FSNs to process: ${fsns.length}`);
-  console.log(`Estimated time: ~${Math.ceil(fsns.length * 0.2)} minutes`);
   console.log(`Pincodes: ${CITY_NAMES.join(', ')}`);
 
   // Get Sheets API token (service account)
@@ -343,6 +472,52 @@ async function main() {
     console.error('Failed to get Sheets token:', e.message);
     console.log('Continuing without sheet updates...');
   }
+
+  // Setup category tabs + red formatting (chunk 0 only to avoid race conditions)
+  if (token && useCategories && (opts.chunk === null || opts.chunk === 0)) {
+    const catNames = Object.keys(catData.catFSNs);
+    try {
+      await ensureCategoryTabs(catNames, token);
+      await addRedFormatting(token);
+    } catch (e) {
+      console.error('Tab setup error:', e.message);
+    }
+  } else if (token && !useCategories) {
+    // Fallback: write Tracker headers only
+    try {
+      const headers = [
+        'FSN', 'Product Name', 'MRP', 'Selling Price',
+        'Delhi Stock', 'Delhi Delivery', 'Bangalore Stock', 'Bangalore Delivery',
+        'Mumbai Stock', 'Mumbai Delivery', 'Pune Stock', 'Pune Delivery', 'Last Checked'
+      ];
+      await writeToSheet('Tracker', [headers], 1, token);
+      console.log('Sheet headers written');
+    } catch (e) {
+      console.error('Could not write headers:', e.message);
+    }
+  }
+
+  // If chunk > 0, wait for chunk 0 to create tabs
+  if (token && useCategories && opts.chunk !== null && opts.chunk > 0) {
+    console.log('Waiting 10s for chunk 0 to create tabs...');
+    await delay(10000);
+  }
+
+  // Compute per-category row offsets for this chunk
+  const catRowCounters = {};
+  if (useCategories) {
+    for (const tab of Object.keys(catData.catFSNs)) catRowCounters[tab] = 2;
+    // Count FSNs in earlier chunks for each category to get correct starting row
+    for (let j = 0; j < chunkStart; j++) {
+      const tab = catData.map[allFSNs[j]];
+      if (tab && catRowCounters[tab] !== undefined) {
+        catRowCounters[tab]++;
+      }
+    }
+  }
+
+  // Tracker row offset
+  let trackerRow = 2 + chunkStart;
 
   // Launch browser (full puppeteer includes Chromium)
   console.log('Launching Chromium...');
@@ -382,38 +557,7 @@ async function main() {
     }
   });
 
-  // Calculate starting row in Google Sheet based on chunk offset
-  let sheetRowOffset = 2; // Row 1 = header, data starts at row 2
-  if (opts.chunk !== null && opts.totalChunks !== null) {
-    const chunkSize = Math.ceil(
-      fs.readFileSync(FSN_FILE, 'utf8').trim().split('\n').filter(Boolean).length / opts.totalChunks
-    );
-    sheetRowOffset = 2 + (opts.chunk * chunkSize);
-  }
-
-  // Write sheet headers
-  if (token) {
-    const headers = [
-      'FSN', 'Product Name', 'MRP', 'Selling Price',
-      'Delhi Stock', 'Delhi Delivery',
-      'Bangalore Stock', 'Bangalore Delivery',
-      'Mumbai Stock', 'Mumbai Delivery',
-      'Pune Stock', 'Pune Delivery',
-      'Last Checked'
-    ];
-    try {
-      const hRange = 'Tracker!A1:M1';
-      await sheetsAPI('PUT',
-        `/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(hRange)}?valueInputOption=RAW`,
-        { range: hRange, values: [headers] }, token
-      );
-      console.log('Sheet headers written');
-    } catch (e) {
-      console.error('Could not write headers:', e.message);
-    }
-  }
-
-  const batchBuffer = [];
+  let pendingWrites = [];
   let processed = 0;
   let errors = 0;
   let consecutiveErrors = 0;
@@ -438,7 +582,6 @@ async function main() {
     if (info.name === 'Error') {
       errors++;
       consecutiveErrors++;
-      // Backoff: if many consecutive errors, Flipkart is likely blocking this IP
       if (consecutiveErrors >= 5) {
         console.log(`  >> ${consecutiveErrors} consecutive errors — pausing 60s to avoid IP block`);
         await delay(60000);
@@ -462,33 +605,55 @@ async function main() {
 
       const inStock = info.available && delivery.available;
       row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
-
       console.log(`  ${CITY_NAMES[p]} (${PINCODES[p]}): ${inStock ? 'In Stock' : 'OOS'} | Del: ${delivery.dd}`);
     }
 
     // Add timestamp
     row.push(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-    batchBuffer.push(row);
     processed++;
 
-    // Write to sheet in batches
-    if (token && (batchBuffer.length >= BATCH_SIZE || i === fsns.length - 1)) {
-      const startRow = sheetRowOffset + (i - batchBuffer.length + 1);
-      try {
-        await writeToSheet(batchBuffer, startRow, token);
-        console.log(`  >> Written ${batchBuffer.length} rows (${startRow}-${startRow + batchBuffer.length - 1}) to Google Sheet`);
-      } catch (e) {
-        console.error(`  >> Sheet write error: ${e.message}`);
-        // Refresh token and retry
-        try {
-          token = await getAccessToken(saConfig);
-          await writeToSheet(batchBuffer, startRow, token);
-          console.log(`  >> Retry succeeded`);
-        } catch (e2) {
-          console.error(`  >> Retry also failed: ${e2.message}`);
+    // Queue writes: Tracker tab + category tab
+    if (token) {
+      pendingWrites.push({
+        range: `Tracker!A${trackerRow}:M${trackerRow}`,
+        values: [row]
+      });
+      trackerRow++;
+
+      if (useCategories) {
+        const catTab = catData.map[fsn];
+        if (catTab && catRowCounters[catTab] !== undefined) {
+          pendingWrites.push({
+            range: `'${catTab}'!A${catRowCounters[catTab]}:M${catRowCounters[catTab]}`,
+            values: [row]
+          });
+          catRowCounters[catTab]++;
         }
       }
-      batchBuffer.length = 0;
+
+      // Flush batch every BATCH_SIZE FSNs or at the end
+      if (pendingWrites.length >= BATCH_SIZE * 2 || i === fsns.length - 1) {
+        try {
+          await sheetsAPI('POST',
+            `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+            { valueInputOption: 'RAW', data: pendingWrites }, token
+          );
+          console.log(`  >> Flushed ${pendingWrites.length} ranges to Google Sheet`);
+        } catch (e) {
+          console.error(`  >> Sheet write error: ${e.message}`);
+          try {
+            token = await getAccessToken(saConfig);
+            await sheetsAPI('POST',
+              `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+              { valueInputOption: 'RAW', data: pendingWrites }, token
+            );
+            console.log(`  >> Retry succeeded`);
+          } catch (e2) {
+            console.error(`  >> Retry also failed: ${e2.message}`);
+          }
+        }
+        pendingWrites = [];
+      }
     }
 
     // Delay between FSNs (1.5s to be less aggressive)
