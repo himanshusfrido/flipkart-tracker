@@ -13,7 +13,10 @@
  *   node scraper-cloud.js --chunk 0 --total-chunks 4  # Run chunk 0 of 4
  */
 
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
+
 const fs = require('fs');
 const https = require('https');
 const path = require('path');
@@ -27,7 +30,7 @@ const CITY_NAMES = ['Delhi', 'Bangalore', 'Mumbai', 'Pune'];
 const FSN_FILE = path.join(__dirname, '..', 'FSN_LIST.txt');
 const FSN_CAT_FILE = path.join(__dirname, '..', 'FSN_CATEGORIES.csv');
 const BATCH_SIZE = 10;
-const PAGE_TIMEOUT = 45000;
+const PAGE_TIMEOUT = 30000;
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [5000, 15000, 30000];
 const USER_AGENTS = [
@@ -298,7 +301,14 @@ async function addRedFormatting(token) {
 // Load a product page once, extract product info (name, MRP, SP) from JSON-LD
 async function loadProductPage(page, fsn) {
   try {
-    await page.goto(`https://www.flipkart.com/product/p/itm?pid=${fsn}`, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
+    await page.goto(`https://www.flipkart.com/product/p/itm?pid=${fsn}`, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+    // Wait for JSON-LD or product content to be available
+    try {
+      await page.waitForFunction(() => {
+        return document.querySelector('script[type="application/ld+json"]') ||
+               document.body.innerText.length > 500;
+      }, { timeout: 10000 });
+    } catch (e) {}
     await delay(1500);
 
     // Close login popup
@@ -584,12 +594,21 @@ async function main() {
       '--disable-translate',
       '--metrics-recording-only',
       '--no-first-run',
-      '--safebrowsing-disable-auto-update'
+      '--safebrowsing-disable-auto-update',
+      '--disable-blink-features=AutomationControlled'
     ]
   });
 
   const page = await browser.newPage();
   await page.setViewport({ width: 1366, height: 768 });
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Linux"',
+    'Upgrade-Insecure-Requests': '1'
+  });
   await page.setRequestInterception(true);
   page.on('request', (req) => {
     const type = req.resourceType();
