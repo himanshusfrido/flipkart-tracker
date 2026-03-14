@@ -2,7 +2,7 @@
 # Flipkart Product Tracker - GitHub Actions Workflow
 # ============================================================
 # Runs 3x daily at 10:30 AM, 4:30 PM, 10:30 PM IST
-# Splits 774 FSNs across 2 parallel jobs
+# Splits 771 FSNs across 2 parallel jobs
 #
 # IMPORTANT: This must be in a PUBLIC repository for FREE
 # unlimited minutes. Private repos have a 2000 min/month limit.

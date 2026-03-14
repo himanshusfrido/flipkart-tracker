@@ -27,7 +27,7 @@ const CITY_NAMES = ['Delhi', 'Bangalore', 'Mumbai', 'Pune'];
 const FSN_FILE = path.join(__dirname, '..', 'FSN_LIST.txt');
 const FSN_CAT_FILE = path.join(__dirname, '..', 'FSN_CATEGORIES.csv');
 const BATCH_SIZE = 10;
-const CONCURRENCY = 4; // Number of parallel browser pages per chunk
+const CONCURRENCY = 2; // Number of parallel browser pages per chunk
 const PAGE_TIMEOUT = 45000;
 
 // ─── PARSE CLI ARGS ─────────────────────────────────────────
@@ -330,16 +330,10 @@ async function loadProductPage(page, fsn) {
       const bt = document.body.innerText;
       const colorIdx = bt.indexOf('Selected Color');
       const priceText = colorIdx > -1 ? bt.substring(colorIdx) : bt;
-      const dm = priceText.match(/(\d+)%\n([\d,]+)\n\u20B9([\d,]+)/);
+      const dm = priceText.match(/(\d+)%\s+([\d,]+)\s+\u20B9([\d,]+)/);
       if (dm) {
         mrp = '\u20B9' + dm[2];
         if (sp === 'N/A') sp = '\u20B9' + dm[3];
-      } else {
-        const dm2 = priceText.match(/(\d+)%\s*[\n\r]*([\d,]+)\s*[\n\r]*\u20B9([\d,]+)/);
-        if (dm2) {
-          mrp = '\u20B9' + dm2[2];
-          if (sp === 'N/A') sp = '\u20B9' + dm2[3];
-        }
       }
 
       // Fallback: name from body text
@@ -368,56 +362,97 @@ async function loadProductPage(page, fsn) {
 // Enter/change pincode and extract delivery info (without reloading the page)
 async function checkPincode(page, pincode) {
   try {
-    // Click delivery location link
-    const links = await page.$$('a, div, span');
-    for (const el of links) {
-      const text = await page.evaluate(e => e.textContent.trim(), el);
-      if (text === 'Select delivery location' || text.includes('Select delivery location')
-          || text === 'Change' || text.includes('Enter pincode')) {
-        await el.click();
-        await delay(1000);
-        break;
-      }
-    }
-
-    // Find and fill pincode input
-    const allInputs = await page.$$('input');
-    for (const inp of allInputs) {
-      const ph = await page.evaluate(e => e.placeholder, inp);
-      if (ph && (ph.toLowerCase().includes('pincode') || ph.toLowerCase().includes('pin code') || ph.includes('Enter'))) {
-        await inp.click({ clickCount: 3 });
-        await inp.type(pincode, { delay: 20 });
-        await delay(300);
-        const btns = await page.$$('button, span');
-        for (const b of btns) {
-          const t = await page.evaluate(e => e.textContent.trim(), b);
-          if (t === 'Apply' || t === 'Check' || t === 'Submit') { await b.click(); break; }
+    // Click delivery location link (single evaluate — no round-trips)
+    await page.evaluate(() => {
+      const els = document.querySelectorAll('a, div, span');
+      for (const el of els) {
+        const t = el.textContent.trim();
+        if (t === 'Select delivery location' || t === 'Change' || t === 'Enter pincode') {
+          el.click();
+          break;
         }
-        await delay(2000);
-        break;
       }
+    });
+
+    // Wait for pincode input to appear
+    let inputFound = false;
+    try {
+      await page.waitForFunction(() => {
+        const inputs = document.querySelectorAll('input');
+        for (const inp of inputs) {
+          const ph = (inp.placeholder || '').toLowerCase();
+          if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter')) return true;
+        }
+        return false;
+      }, { timeout: 5000 });
+      inputFound = true;
+    } catch (e) {
+      // Input didn't appear — try direct entry anyway
     }
 
-    // Extract delivery info
+    if (inputFound) {
+      // Fill pincode using evaluate (fast, no round-trips per element)
+      await page.evaluate((pin) => {
+        const inputs = document.querySelectorAll('input');
+        for (const inp of inputs) {
+          const ph = (inp.placeholder || '').toLowerCase();
+          if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter')) {
+            // Clear and set value using native input setter (React-compatible)
+            const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeSet.call(inp, pin);
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            break;
+          }
+        }
+      }, pincode);
+      await delay(500);
+
+      // Click Apply/Check/Submit button
+      await page.evaluate(() => {
+        const btns = document.querySelectorAll('button, span');
+        for (const b of btns) {
+          const t = b.textContent.trim();
+          if (t === 'Apply' || t === 'Check' || t === 'Submit') { b.click(); break; }
+        }
+      });
+      await delay(2500);
+    }
+
+    // Extract delivery info — scoped to delivery section, not full page
     const delivery = await page.evaluate(() => {
       const bt = document.body.innerText;
+      if (bt.includes('Currently unavailable') || bt.includes('Sold Out') || bt.includes('Out of stock')) {
+        return { dd: 'N/A', available: false };
+      }
       if (bt.includes('not serviceable') || bt.includes('Cannot be delivered') || bt.includes('delivery not available')) {
         return { dd: 'Not Serviceable', available: false };
       }
+
+      // Scope to delivery section — find "Delivery" near pincode area
       let dd = 'N/A';
+      const delivIdx = bt.indexOf('Delivery details');
+      const scopedText = delivIdx > -1 ? bt.substring(delivIdx, delivIdx + 500) : bt;
+
       const patterns = [
-        /Delivery\s*\n\s*by\s+(\d+\s+\w+,?\s*\w*)/i,
         /Delivery\s+by\s+(\d+\s+\w+,?\s*\w*)/i,
+        /Delivery\s*\n\s*by\s+(\d+\s+\w+,?\s*\w*)/i,
         /Delivered\s+by\s+(\d+\s+\w+,?\s*\w*)/i,
         /Get it by\s+(\d+\s+\w+,?\s*\w*)/i,
         /Delivery in\s+(\d+\s+\w+)/i
       ];
       for (const p of patterns) {
-        const m = bt.match(p);
+        const m = scopedText.match(p);
         if (m) { dd = m[1].trim().replace(/,?\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i, ''); break; }
       }
-      const oos = bt.includes('Currently unavailable') || bt.includes('Sold Out') || bt.includes('Out of stock');
-      return { dd, available: !oos };
+      // Fallback: try full body if scoped didn't find anything
+      if (dd === 'N/A') {
+        for (const p of patterns) {
+          const m = bt.match(p);
+          if (m) { dd = m[1].trim().replace(/,?\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i, ''); break; }
+        }
+      }
+      return { dd, available: true };
     });
 
     return delivery;
@@ -500,8 +535,8 @@ async function main() {
 
   // If chunk > 0, wait for chunk 0 to create tabs
   if (token && useCategories && opts.chunk !== null && opts.chunk > 0) {
-    console.log('Waiting 10s for chunk 0 to create tabs...');
-    await delay(10000);
+    console.log('Waiting 30s for chunk 0 to create tabs...');
+    await delay(30000);
   }
 
   // Pre-assign row numbers for each FSN (avoids race conditions with concurrent workers)
