@@ -18,7 +18,15 @@ const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
 const FSN_FILE = path.join(__dirname, 'FSN_LIST.txt');
 const FSN_CAT_FILE = path.join(__dirname, 'FSN_CATEGORIES.csv');
 const BATCH_SIZE = 10;
-const CONCURRENCY = 2;
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [5000, 15000, 30000];
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+];
 const HEADLESS = true;
 const LOG_DIR = path.join(__dirname, 'logs');
 const CSV_DIR = path.join(__dirname, 'csv_backups');
@@ -596,138 +604,103 @@ async function main() {
     process.exit(1);
   }
 
-  // Shared FSN queue — workers pop from end
-  const fsnQueue = fsns.slice().reverse();
-  let globalProcessed = 0;
-  const totalFSNs = fsns.length;
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 768 });
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    const rt = req.resourceType();
+    if (rt === 'image' || rt === 'font' || rt === 'media') req.abort();
+    else req.continue();
+  });
 
-  // CSV write lock (simple mutex for file append)
-  let csvWriting = false;
-  async function appendCSV(row) {
-    while (csvWriting) await delay(10);
-    csvWriting = true;
-    fs.appendFileSync(csvFile, row.map(escapeCSV).join(',') + '\n', 'utf8');
-    csvWriting = false;
-  }
+  let pendingWrites = [];
+  let totalProcessed = 0;
+  let totalErrors = 0;
 
-  // Worker function: each worker gets its own page
-  async function scrapeWorker(workerId) {
-    const page = await browser.newPage();
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setViewport({ width: 1366, height: 768 });
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const rt = req.resourceType();
-      if (rt === 'image' || rt === 'font' || rt === 'media') req.abort();
-      else req.continue();
-    });
+  for (let i = 0; i < fsns.length; i++) {
+    const fsn = fsns[i];
+    log(`[${i + 1}/${fsns.length}] Processing FSN: ${fsn}`);
 
-    let processed = 0, errors = 0;
-    let pendingWrites = [];
+    // Rotate User-Agent
+    await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
 
-    while (fsnQueue.length > 0) {
-      const fsn = fsnQueue.pop();
-      if (!fsn) break;
-
-      globalProcessed++;
-      log(`[W${workerId}] [${globalProcessed}/${totalFSNs}] ${fsn}`);
-
-      const info = await loadProductPage(page, fsn);
-      const row = [fsn, info.name, info.mrp, info.sp];
-
-      for (let p = 0; p < PINCODES.length; p++) {
-        let delivery;
-        try {
-          delivery = await checkPincode(page, PINCODES[p]);
-        } catch (e) {
-          logError(`  [W${workerId}] Pincode error ${fsn}/${PINCODES[p]}`, e);
-          delivery = { dd: 'Error', available: false };
-          errors++;
-        }
-        const inStock = info.available && delivery.available;
-        row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
-        log(`  [W${workerId}] ${CITY_NAMES[p]}: ${inStock ? 'In Stock' : 'OOS'} | Del: ${delivery.dd}`);
+    // Load page with exponential backoff retry
+    let info = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      info = await loadProductPage(page, fsn);
+      if (info.name !== 'Error') break;
+      if (attempt < MAX_RETRIES) {
+        const retryDelay = RETRY_DELAYS[attempt];
+        log(`  Retry ${attempt + 1}/${MAX_RETRIES} after ${retryDelay / 1000}s...`);
+        await page.goto('about:blank').catch(() => {});
+        await delay(retryDelay);
       }
+    }
 
-      row.push(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-      processed++;
+    const row = [fsn, info.name, info.mrp, info.sp];
 
-      // Append to CSV
-      await appendCSV(row);
+    // Check each pincode
+    for (let p = 0; p < PINCODES.length; p++) {
+      let delivery;
+      try {
+        delivery = await checkPincode(page, PINCODES[p]);
+      } catch (e) {
+        logError(`  Pincode error ${fsn}/${PINCODES[p]}`, e);
+        delivery = { dd: 'Error', available: false };
+        totalErrors++;
+      }
+      const inStock = info.available && delivery.available;
+      row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
+      log(`  ${CITY_NAMES[p]}: ${inStock ? 'In Stock' : 'OOS'} | Del: ${delivery.dd}`);
+    }
 
-      // Queue sheet writes using pre-assigned rows
-      if (sheetsEnabled) {
-        const rowInfo = fsnRowMap[fsn];
+    row.push(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
+    totalProcessed++;
+
+    // Append to CSV
+    fs.appendFileSync(csvFile, row.map(escapeCSV).join(',') + '\n', 'utf8');
+
+    // Queue sheet writes using pre-assigned rows
+    if (sheetsEnabled) {
+      const rowInfo = fsnRowMap[fsn];
+      pendingWrites.push({
+        range: `Tracker!A${rowInfo.trackerRow}:M${rowInfo.trackerRow}`,
+        values: [row]
+      });
+      if (rowInfo.catTab && rowInfo.catRow) {
         pendingWrites.push({
-          range: `Tracker!A${rowInfo.trackerRow}:M${rowInfo.trackerRow}`,
+          range: `'${rowInfo.catTab}'!A${rowInfo.catRow}:M${rowInfo.catRow}`,
           values: [row]
         });
-        if (rowInfo.catTab && rowInfo.catRow) {
-          pendingWrites.push({
-            range: `'${rowInfo.catTab}'!A${rowInfo.catRow}:M${rowInfo.catRow}`,
-            values: [row]
-          });
-        }
-
-        if (pendingWrites.length >= BATCH_SIZE * 2) {
-          try {
-            token = await getAccessToken();
-            await sheetsRequest('POST',
-              `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
-              { valueInputOption: 'RAW', data: pendingWrites }, token
-            );
-            log(`  [W${workerId}] Flushed ${pendingWrites.length} ranges`);
-          } catch (e) {
-            logError(`[W${workerId}] Sheet write error`, e);
-          }
-          pendingWrites = [];
-        }
       }
 
-      if (fsnQueue.length > 0) await delay(1000);
-    }
-
-    // Flush remaining writes
-    if (sheetsEnabled && pendingWrites.length > 0) {
-      try {
-        token = await getAccessToken();
-        await sheetsRequest('POST',
-          `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
-          { valueInputOption: 'RAW', data: pendingWrites }, token
-        );
-        log(`  [W${workerId}] Final flush: ${pendingWrites.length} ranges`);
-      } catch (e) {
-        logError(`[W${workerId}] Final flush error`, e);
+      if (pendingWrites.length >= BATCH_SIZE * 2 || i === fsns.length - 1) {
+        try {
+          token = await getAccessToken();
+          await sheetsRequest('POST',
+            `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+            { valueInputOption: 'RAW', data: pendingWrites }, token
+          );
+          log(`  >> Flushed ${pendingWrites.length} ranges to sheet`);
+        } catch (e) {
+          logError('Sheet write error', e);
+        }
+        pendingWrites = [];
       }
     }
 
-    await page.close();
-    return { processed, errors };
+    // Delay between FSNs: 1s (local has no IP blocking issues)
+    if (i < fsns.length - 1) await delay(1000);
   }
 
-  // Launch concurrent workers
-  const numWorkers = Math.min(CONCURRENCY, fsns.length);
-  log(`Launching ${numWorkers} concurrent workers...`);
-  const workerPromises = [];
-  for (let w = 0; w < numWorkers; w++) {
-    workerPromises.push(scrapeWorker(w));
-    if (w < numWorkers - 1) await delay(2000);
-  }
-  const results = await Promise.all(workerPromises);
-
-  // Cleanup
   await browser.close();
   log('Chrome closed');
 
-  // Summary
-  const totalDone = results.reduce((s, r) => s + r.processed, 0);
-  const totalErrors = results.reduce((s, r) => s + r.errors, 0);
   const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
   log('========================================');
   log('  Run Complete');
   log('========================================');
-  log(`Workers: ${numWorkers}`);
-  log(`Total FSNs processed: ${totalDone}/${fsns.length}`);
+  log(`Total FSNs processed: ${totalProcessed}/${fsns.length}`);
   log(`Errors: ${totalErrors}`);
   log(`Time elapsed: ${elapsed} minutes`);
   log(`CSV backup: ${csvFile}`);

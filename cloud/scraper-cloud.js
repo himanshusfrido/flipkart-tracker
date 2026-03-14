@@ -27,8 +27,16 @@ const CITY_NAMES = ['Delhi', 'Bangalore', 'Mumbai', 'Pune'];
 const FSN_FILE = path.join(__dirname, '..', 'FSN_LIST.txt');
 const FSN_CAT_FILE = path.join(__dirname, '..', 'FSN_CATEGORIES.csv');
 const BATCH_SIZE = 10;
-const CONCURRENCY = 2; // Number of parallel browser pages per chunk
 const PAGE_TIMEOUT = 45000;
+const MAX_RETRIES = 3;
+const RETRY_DELAYS = [5000, 15000, 30000];
+const USER_AGENTS = [
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+];
 
 // ─── PARSE CLI ARGS ─────────────────────────────────────────
 function parseArgs() {
@@ -560,7 +568,7 @@ async function main() {
     };
   }
 
-  // Launch browser (full puppeteer includes Chromium)
+  // Launch browser
   console.log('Launching Chromium...');
   const browser = await puppeteer.launch({
     headless: 'new',
@@ -580,163 +588,129 @@ async function main() {
     ]
   });
 
-  // Shared FSN queue — workers pop from end
-  const fsnQueue = fsns.slice().reverse();
-  let totalProcessed = 0;
-  let totalFSNs = fsns.length;
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 768 });
+  await page.setRequestInterception(true);
+  page.on('request', (req) => {
+    const type = req.resourceType();
+    if (['image', 'font', 'media'].includes(type)) req.abort();
+    else req.continue();
+  });
 
-  // Worker function: each worker gets its own page and processes FSNs from shared queue
-  async function scrapeWorker(workerId) {
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-    await page.setViewport({ width: 1366, height: 768 });
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const type = req.resourceType();
-      if (['image', 'font', 'media'].includes(type)) req.abort();
-      else req.continue();
-    });
+  let pendingWrites = [];
+  let processed = 0;
+  let errors = 0;
+  let consecutiveErrors = 0;
 
-    let processed = 0, errors = 0, consecutiveErrors = 0;
-    let pendingWrites = [];
+  for (let i = 0; i < fsns.length; i++) {
+    const fsn = fsns[i];
+    const elapsed = ((Date.now() - startTime) / 60000).toFixed(1);
+    console.log(`[${i + 1}/${fsns.length}] ${fsn} (${elapsed}m elapsed)`);
 
-    while (fsnQueue.length > 0) {
-      const fsn = fsnQueue.pop();
-      if (!fsn) break;
+    // Rotate User-Agent per FSN
+    await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
 
-      totalProcessed++;
-      const elapsed = ((Date.now() - startTime) / 60000).toFixed(1);
-      console.log(`[W${workerId}] [${totalProcessed}/${totalFSNs}] ${fsn} (${elapsed}m)`);
-
-      // Load page ONCE per FSN
-      let info = await loadProductPage(page, fsn);
-
-      // Retry once on error
-      if (info.name === 'Error') {
-        console.log(`  [W${workerId}] Retrying ${fsn} after 5s...`);
-        await delay(5000);
-        info = await loadProductPage(page, fsn);
+    // Load page with exponential backoff retry
+    let info = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      info = await loadProductPage(page, fsn);
+      if (info.name !== 'Error') break;
+      if (attempt < MAX_RETRIES) {
+        const retryDelay = RETRY_DELAYS[attempt];
+        console.log(`  Retry ${attempt + 1}/${MAX_RETRIES} after ${retryDelay / 1000}s...`);
+        await page.goto('about:blank').catch(() => {});
+        await delay(retryDelay);
       }
+    }
 
-      const row = [fsn, info.name, info.mrp, info.sp];
+    const row = [fsn, info.name, info.mrp, info.sp];
 
-      if (info.name === 'Error') {
+    if (info.name === 'Error') {
+      errors++;
+      consecutiveErrors++;
+      if (consecutiveErrors >= 5) {
+        console.log(`  >> ${consecutiveErrors} consecutive errors — pausing 60s`);
+        await delay(60000);
+      } else if (consecutiveErrors >= 3) {
+        console.log(`  >> ${consecutiveErrors} consecutive errors — pausing 30s`);
+        await delay(30000);
+      }
+    } else {
+      consecutiveErrors = 0;
+    }
+
+    // Check each pincode WITHOUT reloading
+    for (let p = 0; p < PINCODES.length; p++) {
+      let delivery;
+      try {
+        delivery = await checkPincode(page, PINCODES[p]);
+      } catch (e) {
+        delivery = { dd: 'Error', available: false };
         errors++;
-        consecutiveErrors++;
-        if (consecutiveErrors >= 5) {
-          console.log(`  [W${workerId}] ${consecutiveErrors} consecutive errors — pausing 60s`);
-          await delay(60000);
-        } else if (consecutiveErrors >= 3) {
-          console.log(`  [W${workerId}] ${consecutiveErrors} consecutive errors — pausing 30s`);
-          await delay(30000);
-        }
-      } else {
-        consecutiveErrors = 0;
       }
+      const inStock = info.available && delivery.available;
+      row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
+      console.log(`  ${CITY_NAMES[p]}: ${inStock ? 'In Stock' : 'OOS'} | Del: ${delivery.dd}`);
+    }
 
-      // Check each pincode WITHOUT reloading
-      for (let p = 0; p < PINCODES.length; p++) {
-        let delivery;
-        try {
-          delivery = await checkPincode(page, PINCODES[p]);
-        } catch (e) {
-          delivery = { dd: 'Error', available: false };
-          errors++;
-        }
-        const inStock = info.available && delivery.available;
-        row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
-        console.log(`  [W${workerId}] ${CITY_NAMES[p]}: ${inStock ? 'In Stock' : 'OOS'} | Del: ${delivery.dd}`);
-      }
+    row.push(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
+    processed++;
 
-      row.push(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-      processed++;
-
-      // Queue sheet writes using pre-assigned rows
-      if (token) {
-        const rowInfo = fsnRowMap[fsn];
+    // Queue sheet writes using pre-assigned rows
+    if (token) {
+      const rowInfo = fsnRowMap[fsn];
+      pendingWrites.push({
+        range: `Tracker!A${rowInfo.trackerRow}:M${rowInfo.trackerRow}`,
+        values: [row]
+      });
+      if (rowInfo.catTab && rowInfo.catRow) {
         pendingWrites.push({
-          range: `Tracker!A${rowInfo.trackerRow}:M${rowInfo.trackerRow}`,
+          range: `'${rowInfo.catTab}'!A${rowInfo.catRow}:M${rowInfo.catRow}`,
           values: [row]
         });
-        if (rowInfo.catTab && rowInfo.catRow) {
-          pendingWrites.push({
-            range: `'${rowInfo.catTab}'!A${rowInfo.catRow}:M${rowInfo.catRow}`,
-            values: [row]
-          });
-        }
+      }
 
-        // Flush every BATCH_SIZE FSNs
-        if (pendingWrites.length >= BATCH_SIZE * 2) {
+      // Flush every BATCH_SIZE FSNs or at end
+      if (pendingWrites.length >= BATCH_SIZE * 2 || i === fsns.length - 1) {
+        try {
+          await sheetsAPI('POST',
+            `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+            { valueInputOption: 'RAW', data: pendingWrites }, token
+          );
+          console.log(`  >> Flushed ${pendingWrites.length} ranges to sheet`);
+        } catch (e) {
+          console.error(`  >> Sheet write error: ${e.message}`);
           try {
+            token = await getAccessToken(saConfig);
             await sheetsAPI('POST',
               `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
               { valueInputOption: 'RAW', data: pendingWrites }, token
             );
-            console.log(`  [W${workerId}] Flushed ${pendingWrites.length} ranges`);
-          } catch (e) {
-            console.error(`  [W${workerId}] Sheet write error: ${e.message}`);
-            try {
-              token = await getAccessToken(saConfig);
-              await sheetsAPI('POST',
-                `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
-                { valueInputOption: 'RAW', data: pendingWrites }, token
-              );
-            } catch (e2) {
-              console.error(`  [W${workerId}] Retry failed: ${e2.message}`);
-            }
+          } catch (e2) {
+            console.error(`  >> Retry failed: ${e2.message}`);
           }
-          pendingWrites = [];
         }
-      }
-
-      // Delay between FSNs (2s per worker; with 4 workers effective = ~500ms between requests)
-      if (fsnQueue.length > 0) await delay(2000);
-    }
-
-    // Flush remaining writes
-    if (token && pendingWrites.length > 0) {
-      try {
-        await sheetsAPI('POST',
-          `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
-          { valueInputOption: 'RAW', data: pendingWrites }, token
-        );
-        console.log(`  [W${workerId}] Final flush: ${pendingWrites.length} ranges`);
-      } catch (e) {
-        console.error(`  [W${workerId}] Final flush error: ${e.message}`);
+        pendingWrites = [];
       }
     }
 
-    await page.close();
-    return { processed, errors };
+    // Delay between FSNs: 3s + random 0-2s jitter
+    if (i < fsns.length - 1) {
+      const jitter = Math.floor(Math.random() * 2000);
+      await delay(3000 + jitter);
+    }
   }
-
-  // Launch concurrent workers
-  const numWorkers = Math.min(CONCURRENCY, fsns.length);
-  console.log(`Launching ${numWorkers} concurrent workers...`);
-  const workerPromises = [];
-  for (let w = 0; w < numWorkers; w++) {
-    workerPromises.push(scrapeWorker(w));
-    // Stagger worker starts by 3s to avoid hitting Flipkart simultaneously
-    if (w < numWorkers - 1) await delay(3000);
-  }
-  const results = await Promise.all(workerPromises);
 
   await browser.close();
 
-  const totalErrors = results.reduce((s, r) => s + r.errors, 0);
-  const totalDone = results.reduce((s, r) => s + r.processed, 0);
   const totalTime = ((Date.now() - startTime) / 60000).toFixed(1);
-
   console.log(`\n=== COMPLETE ===`);
-  console.log(`Workers: ${numWorkers}`);
-  console.log(`Processed: ${totalDone}/${fsns.length} FSNs`);
-  console.log(`Errors: ${totalErrors}`);
+  console.log(`Processed: ${processed}/${fsns.length} FSNs`);
+  console.log(`Errors: ${errors}`);
   console.log(`Time: ${totalTime} minutes`);
   console.log(`Sheet: https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}`);
 
-  if (totalErrors > fsns.length * 0.5) {
+  if (errors > fsns.length * 0.5) {
     console.error('WARNING: More than 50% errors. Flipkart may be blocking this IP.');
     process.exit(1);
   }
