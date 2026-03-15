@@ -689,8 +689,11 @@ async function main() {
       }
     }
 
-    // Delay between FSNs: 1s (local has no IP blocking issues)
-    if (i < fsns.length - 1) await delay(1000);
+    // Delay between FSNs: 3s + random 0-2s jitter
+    if (i < fsns.length - 1) {
+      const jitter = Math.floor(Math.random() * 2000);
+      await delay(3000 + jitter);
+    }
   }
 
   await browser.close();
