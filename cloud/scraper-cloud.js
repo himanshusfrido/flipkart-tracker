@@ -31,8 +31,8 @@ const FSN_FILE = path.join(__dirname, '..', 'FSN_LIST.txt');
 const FSN_CAT_FILE = path.join(__dirname, '..', 'FSN_CATEGORIES.csv');
 const BATCH_SIZE = 10;
 const PAGE_TIMEOUT = 30000;
-const MAX_RETRIES = 3;
-const RETRY_DELAYS = [5000, 15000, 30000];
+const MAX_RETRIES = 2;
+const RETRY_DELAYS = [3000, 8000];
 const USER_AGENTS = [
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -506,12 +506,13 @@ async function createWorkerPage(browser) {
 }
 
 // Process all FSNs for one category on a dedicated page
-async function processCategoryWorker(page, catName, catFSNs, fsnRowMap, context) {
+async function processCategoryWorker(browser, catName, catFSNs, fsnRowMap, context) {
   const { startTime, saConfig } = context;
   let catErrors = 0;
   let catProcessed = 0;
   let consecutiveErrors = 0;
   let pendingWrites = [];
+  let page = await createWorkerPage(browser);
 
   console.log(`[${catName}] Starting — ${catFSNs.length} FSNs`);
 
@@ -523,7 +524,7 @@ async function processCategoryWorker(page, catName, catFSNs, fsnRowMap, context)
     // Rotate User-Agent per FSN
     await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
 
-    // Load page with exponential backoff retry
+    // Load page with retry
     let info = null;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       info = await loadProductPage(page, fsn);
@@ -541,12 +542,16 @@ async function processCategoryWorker(page, catName, catFSNs, fsnRowMap, context)
     if (info.name === 'Error') {
       catErrors++;
       consecutiveErrors++;
-      if (consecutiveErrors >= 5) {
-        console.log(`[${catName}]   >> ${consecutiveErrors} consecutive errors — pausing 60s`);
-        await delay(60000);
+      // On 10+ consecutive errors, recycle the page (fresh connection/cookies)
+      if (consecutiveErrors >= 10 && consecutiveErrors % 10 === 0) {
+        console.log(`[${catName}]   >> ${consecutiveErrors} consecutive errors — recycling page`);
+        await page.close().catch(() => {});
+        await delay(5000);
+        page = await createWorkerPage(browser);
       } else if (consecutiveErrors >= 3) {
-        console.log(`[${catName}]   >> ${consecutiveErrors} consecutive errors — pausing 30s`);
-        await delay(30000);
+        console.log(`[${catName}]   >> ${consecutiveErrors} consecutive errors — pausing 10s`);
+        await page.goto('about:blank').catch(() => {});
+        await delay(10000);
       }
     } else {
       consecutiveErrors = 0;
@@ -768,10 +773,9 @@ async function main() {
     const catFSNs = chunkCatFSNs[catName];
 
     const workerPromise = (async () => {
-      const page = await createWorkerPage(browser);
       // Stagger start by a small random delay to avoid burst requests
       await delay(Math.floor(Math.random() * 3000));
-      return processCategoryWorker(page, catName, catFSNs, fsnRowMap, tokenContext);
+      return processCategoryWorker(browser, catName, catFSNs, fsnRowMap, tokenContext);
     })();
 
     return workerPromise;
