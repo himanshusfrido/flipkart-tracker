@@ -33,8 +33,9 @@ const BATCH_SIZE = 10;
 const PAGE_TIMEOUT = 30000;
 const MAX_RETRIES = 2;
 const RETRY_DELAYS = [3000, 8000];
-const MAX_CONSECUTIVE_ERRORS = 20;  // Abort when IP is clearly blocked
-const MAX_ELAPSED_MINUTES = 180;    // Exit gracefully before GH Actions timeout
+const PARALLEL_WORKERS = 3;            // Concurrent browser pages per chunk
+const MAX_CONSECUTIVE_ERRORS = 20;     // Abort when IP is clearly blocked
+const MAX_ELAPSED_MINUTES = 180;       // Exit gracefully before GH Actions timeout
 const USER_AGENTS = [
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -379,60 +380,74 @@ async function loadProductPage(page, fsn) {
   }
 }
 
+// Helper: check if pincode input is already visible in the DOM
+function pincodeInputSelector() {
+  return `() => {
+    const inputs = document.querySelectorAll('input');
+    for (const inp of inputs) {
+      const ph = (inp.placeholder || '').toLowerCase();
+      if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter pin')) return true;
+    }
+    return false;
+  }`;
+}
+
 // Enter/change pincode and extract delivery info (without reloading the page)
 async function checkPincode(page, pincode) {
   try {
-    // Click delivery location trigger — use partial, case-insensitive matching
-    const clickResult = await page.evaluate(() => {
-      const triggers = [
-        'select delivery location',
-        'enter pincode',
-        'change',
-      ];
-      // Search a, div, span — prefer short text (avoids matching parent containers)
-      let best = null;
-      let bestLen = Infinity;
-      const els = document.querySelectorAll('a, div, span, button');
-      for (const el of els) {
-        const t = (el.textContent || '').trim().toLowerCase();
-        if (t.length > 50) continue; // skip containers with long text
-        for (const trigger of triggers) {
-          if (t === trigger || t.includes(trigger)) {
-            if (t.length < bestLen) {
-              best = el;
-              bestLen = t.length;
+    // Bug C fix: check if pincode input is already visible (popup still open from previous pincode)
+    let inputAlreadyVisible = false;
+    try {
+      inputAlreadyVisible = await page.evaluate(new Function('return (' + pincodeInputSelector() + ')()'));
+    } catch (e) {}
+
+    if (!inputAlreadyVisible) {
+      // Click delivery location trigger
+      // Bug A fix: exact match for 'change' to avoid matching 'exchange offer'
+      const clickResult = await page.evaluate(() => {
+        const partialTriggers = ['select delivery location', 'enter pincode'];
+        let best = null;
+        let bestLen = Infinity;
+        const els = document.querySelectorAll('a, div, span, button');
+        for (const el of els) {
+          const t = (el.textContent || '').trim().toLowerCase();
+          if (t.length > 50) continue;
+          // Exact match for 'change' (avoids 'exchange offer')
+          if (t === 'change' && t.length < bestLen) {
+            best = el; bestLen = t.length;
+            continue;
+          }
+          // Partial match for longer triggers
+          for (const trigger of partialTriggers) {
+            if (t.includes(trigger) && t.length < bestLen) {
+              best = el; bestLen = t.length;
             }
           }
+          // Match 6-digit pincode display (e.g. "110001")
+          if (/^\d{6}$/.test(t) && t.length < bestLen) {
+            best = el; bestLen = t.length;
+          }
         }
-        // Also match if element shows a 6-digit pincode (the "110001" link)
-        if (/^\d{6}$/.test(t) && t.length < bestLen) {
-          best = el;
-          bestLen = t.length;
+        if (best) {
+          best.click();
+          return { clicked: true, text: best.textContent.trim().substring(0, 40) };
         }
-      }
-      if (best) {
-        best.click();
-        return { clicked: true, text: best.textContent.trim().substring(0, 40) };
-      }
-      return { clicked: false, text: null };
-    });
-    console.log(`    Pin ${pincode}: trigger=${clickResult.text || 'NONE'}`);
+        return { clicked: false, text: null };
+      });
+      console.log(`    Pin ${pincode}: trigger=${clickResult.text || 'NONE'}`);
+    } else {
+      console.log(`    Pin ${pincode}: input already visible`);
+    }
 
     // Wait for pincode input to appear
-    let inputFound = false;
-    try {
-      await page.waitForFunction(() => {
-        const inputs = document.querySelectorAll('input');
-        for (const inp of inputs) {
-          const ph = (inp.placeholder || '').toLowerCase();
-          if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter')) return true;
-        }
-        return false;
-      }, { timeout: 5000 });
-      inputFound = true;
-    } catch (e) {
-      // Input didn't appear — try clicking the pincode display text as fallback
-      if (!inputFound) {
+    // Bug B fix: use 'enter pin' instead of bare 'enter' to avoid matching unrelated inputs
+    let inputFound = inputAlreadyVisible;
+    if (!inputFound) {
+      try {
+        await page.waitForFunction(pincodeInputSelector(), { timeout: 5000 });
+        inputFound = true;
+      } catch (e) {
+        // Fallback: try clicking pincode display text
         try {
           await page.evaluate(() => {
             const els = document.querySelectorAll('span, div, a');
@@ -441,14 +456,7 @@ async function checkPincode(page, pincode) {
               if (/^\d{6}$/.test(t)) { el.click(); return; }
             }
           });
-          await page.waitForFunction(() => {
-            const inputs = document.querySelectorAll('input');
-            for (const inp of inputs) {
-              const ph = (inp.placeholder || '').toLowerCase();
-              if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter')) return true;
-            }
-            return false;
-          }, { timeout: 3000 });
+          await page.waitForFunction(pincodeInputSelector(), { timeout: 3000 });
           inputFound = true;
         } catch (e2) {}
       }
@@ -460,11 +468,9 @@ async function checkPincode(page, pincode) {
         const inputs = document.querySelectorAll('input');
         for (const inp of inputs) {
           const ph = (inp.placeholder || '').toLowerCase();
-          if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter')) {
-            // Focus and select all existing text first
+          if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter pin')) {
             inp.focus();
             inp.select();
-            // Clear and set value using native input setter (React-compatible)
             const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
             nativeSet.call(inp, '');
             inp.dispatchEvent(new Event('input', { bubbles: true }));
@@ -477,20 +483,26 @@ async function checkPincode(page, pincode) {
       }, pincode);
       await delay(500);
 
-      // Click Apply/Check/Submit button (partial match)
-      await page.evaluate(() => {
+      // Bug D fix: partial match for Apply button variants
+      const applyClicked = await page.evaluate(() => {
+        const actionWords = ['apply', 'check', 'submit', 'update'];
         const btns = document.querySelectorAll('button, span');
         for (const b of btns) {
           const t = (b.textContent || '').trim().toLowerCase();
-          if (t === 'apply' || t === 'check' || t === 'submit') { b.click(); break; }
+          if (actionWords.some(w => t.includes(w)) && t.length < 30) {
+            b.click();
+            return true;
+          }
         }
+        return false;
       });
+      if (!applyClicked) console.log(`    Pin ${pincode}: WARNING — Apply button not found`);
       await delay(2500);
     } else {
       console.log(`    Pin ${pincode}: WARNING — pincode input not found`);
     }
 
-    // Extract delivery info — scoped to delivery section, not full page
+    // Extract delivery info
     const delivery = await page.evaluate(() => {
       const bt = document.body.innerText;
       if (bt.includes('Currently unavailable') || bt.includes('Sold Out') || bt.includes('Out of stock')) {
@@ -500,7 +512,6 @@ async function checkPincode(page, pincode) {
         return { dd: 'Not Serviceable', available: false };
       }
 
-      // Scope to delivery section — find "Delivery" near pincode area
       let dd = 'N/A';
       const delivIdx = bt.indexOf('Delivery details');
       const scopedText = delivIdx > -1 ? bt.substring(delivIdx, delivIdx + 500) : bt;
@@ -516,7 +527,6 @@ async function checkPincode(page, pincode) {
         const m = scopedText.match(p);
         if (m) { dd = m[1].trim().replace(/,?\s*(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i, ''); break; }
       }
-      // Fallback: try full body if scoped didn't find anything
       if (dd === 'N/A') {
         for (const p of patterns) {
           const m = bt.match(p);
@@ -557,6 +567,164 @@ async function createWorkerPage(browser) {
   return page;
 }
 
+// ─── CONCURRENCY HELPERS ────────────────────────────────────
+
+class Semaphore {
+  constructor(max) { this.max = max; this.current = 0; this.queue = []; }
+  async acquire() {
+    if (this.current < this.max) { this.current++; return; }
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+  release() {
+    this.current--;
+    if (this.queue.length > 0) { this.current++; this.queue.shift()(); }
+  }
+}
+
+class PagePool {
+  constructor() { this.available = []; this.waiters = []; }
+  add(page) { this.available.push(page); }
+  async take() {
+    if (this.available.length > 0) return this.available.pop();
+    return new Promise(resolve => this.waiters.push(resolve));
+  }
+  release(page) {
+    if (this.waiters.length > 0) this.waiters.shift()(page);
+    else this.available.push(page);
+  }
+}
+
+// ─── SCRAPE SINGLE FSN ─────────────────────────────────────
+
+async function scrapeFSN(page, fsn, browser) {
+  // Rotate User-Agent
+  await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
+
+  // Load page with retry
+  let info = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    info = await loadProductPage(page, fsn);
+    if (info.name !== 'Error') break;
+    if (attempt < MAX_RETRIES) {
+      const retryDelay = RETRY_DELAYS[attempt];
+      console.log(`  Retry ${attempt + 1}/${MAX_RETRIES} after ${retryDelay / 1000}s...`);
+      await page.goto('about:blank').catch(() => {});
+      await delay(retryDelay);
+    }
+  }
+
+  const row = [fsn, info.name, info.mrp, info.sp];
+  const isError = info.name === 'Error';
+
+  // Check each pincode
+  for (let p = 0; p < PINCODES.length; p++) {
+    let delivery;
+    try {
+      delivery = await checkPincode(page, PINCODES[p]);
+    } catch (e) {
+      delivery = { dd: 'Error', available: false };
+    }
+    const inStock = info.available && delivery.available;
+    row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
+  }
+
+  row.push(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
+  return { row, isError };
+}
+
+// ─── PROCESS ONE CATEGORY ───────────────────────────────────
+
+async function processCategory(catName, fsnList, pagePool, semaphore, state, browser) {
+  await semaphore.acquire();
+  let page = await pagePool.take();
+  const workerId = state.nextWorkerId++;
+  let localConsecutiveErrors = 0;
+
+  console.log(`[W${workerId}] Starting category: ${catName} (${fsnList.length} FSNs)`);
+
+  try {
+    for (let i = 0; i < fsnList.length; i++) {
+      const fsn = fsnList[i];
+
+      // Check global abort conditions
+      if (state.aborted) {
+        console.log(`[W${workerId}] Aborted — stopping ${catName}`);
+        break;
+      }
+      const elapsedMin = (Date.now() - state.startTime) / 60000;
+      if (elapsedMin >= MAX_ELAPSED_MINUTES) {
+        console.log(`[W${workerId}] TIME LIMIT reached — stopping ${catName}`);
+        state.aborted = true;
+        break;
+      }
+
+      console.log(`[W${workerId}] [${catName}] [${i + 1}/${fsnList.length}] ${fsn} (${elapsedMin.toFixed(1)}m)`);
+
+      const { row, isError } = await scrapeFSN(page, fsn, browser);
+
+      if (isError) {
+        state.totalErrors++;
+        localConsecutiveErrors++;
+        state.consecutiveErrors++;
+
+        // Recycle page on persistent errors
+        if (localConsecutiveErrors >= 5) {
+          console.log(`[W${workerId}] ${localConsecutiveErrors} consecutive errors — recycling page + waiting 15s`);
+          await page.close().catch(() => {});
+          await delay(15000);
+          page = await createWorkerPage(browser);
+          localConsecutiveErrors = 0;
+        }
+
+        // Global abort
+        if (state.consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          console.log(`[W${workerId}] IP BLOCKED — ${state.consecutiveErrors} global consecutive errors`);
+          state.aborted = true;
+          break;
+        }
+      } else {
+        localConsecutiveErrors = 0;
+        state.consecutiveErrors = 0;
+      }
+
+      state.totalProcessed++;
+
+      // Queue writes
+      const rowInfo = state.fsnRowMap[fsn];
+      if (rowInfo) {
+        state.pendingWrites.push({
+          range: `Tracker!A${rowInfo.trackerRow}:M${rowInfo.trackerRow}`,
+          values: [row]
+        });
+        if (rowInfo.catTab && rowInfo.catRow) {
+          state.pendingWrites.push({
+            range: `'${rowInfo.catTab}'!A${rowInfo.catRow}:M${rowInfo.catRow}`,
+            values: [row]
+          });
+        }
+      }
+
+      // Flush if enough writes accumulated
+      if (state.pendingWrites.length >= BATCH_SIZE * 2) {
+        await state.flush();
+      }
+
+      // Inter-FSN delay (reduced since parallel workers provide natural spacing)
+      if (i < fsnList.length - 1) {
+        await delay(2000 + Math.floor(Math.random() * 1500));
+      }
+    }
+  } finally {
+    // Navigate away to free DOM memory
+    await page.goto('about:blank').catch(() => {});
+    pagePool.release(page);
+    semaphore.release();
+    // Flush remaining writes for this category
+    await state.flush();
+    console.log(`[W${workerId}] Finished category: ${catName}`);
+  }
+}
+
 // ─── MAIN ───────────────────────────────────────────────────
 async function main() {
   const startTime = Date.now();
@@ -565,9 +733,9 @@ async function main() {
   console.log('=== Flipkart Product Tracker (Cloud) ===');
   console.log(`Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
   console.log(`Environment: ${process.env.GITHUB_ACTIONS ? 'GitHub Actions' : 'Local'}`);
-  console.log(`Mode: Sequential (CONCURRENCY=1)`);
+  console.log(`Mode: Parallel (${PARALLEL_WORKERS} workers by sub-category)`);
 
-  // Load ALL FSNs (needed for chunk offset calculation)
+  // Load ALL FSNs
   const allFSNs = fs.readFileSync(FSN_FILE, 'utf8').trim().split('\n').map(f => f.trim()).filter(Boolean);
   console.log(`Total FSNs in file: ${allFSNs.length}`);
 
@@ -595,7 +763,7 @@ async function main() {
   console.log(`FSNs to process: ${fsns.length}`);
   console.log(`Pincodes: ${CITY_NAMES.join(', ')}`);
 
-  // Get Sheets API token (service account)
+  // Get Sheets API token
   const saConfig = getServiceAccountConfig();
   let token = null;
   try {
@@ -606,7 +774,7 @@ async function main() {
     console.log('Continuing without sheet updates...');
   }
 
-  // Setup category tabs + red formatting (chunk 0 only to avoid race conditions)
+  // Setup category tabs (chunk 0 only)
   if (token && useCategories && (opts.chunk === null || opts.chunk === 0)) {
     const catNames = Object.keys(catData.catFSNs);
     try {
@@ -617,18 +785,16 @@ async function main() {
     }
   }
 
-  // If chunk > 0, wait for chunk 0 to create tabs
   if (token && useCategories && opts.chunk !== null && opts.chunk > 0) {
     console.log('Waiting 30s for chunk 0 to create tabs...');
     await delay(30000);
   }
 
-  // Pre-assign row numbers for each FSN (avoids race conditions)
+  // Pre-assign row numbers for each FSN
   const fsnRowMap = {};
   const catCounters = {};
   if (useCategories) {
     for (const tab of Object.keys(catData.catFSNs)) catCounters[tab] = 2;
-    // Offset for FSNs in earlier chunks
     for (let j = 0; j < chunkStart; j++) {
       const tab = catData.map[allFSNs[j]];
       if (tab && catCounters[tab] !== undefined) catCounters[tab]++;
@@ -644,22 +810,22 @@ async function main() {
     };
   }
 
-  // Log category breakdown for this chunk
-  if (useCategories) {
-    const chunkCatFSNs = {};
-    for (const fsn of fsns) {
-      const catTab = catData.map[fsn] || 'Uncategorized';
-      if (!chunkCatFSNs[catTab]) chunkCatFSNs[catTab] = [];
-      chunkCatFSNs[catTab].push(fsn);
-    }
-    console.log(`\nCategories in this chunk: ${Object.keys(chunkCatFSNs).length}`);
-    for (const cat of Object.keys(chunkCatFSNs)) {
-      console.log(`  ${cat}: ${chunkCatFSNs[cat].length} FSNs`);
-    }
+  // Group FSNs by category for this chunk, sort largest-first
+  const chunkCatFSNs = {};
+  for (const fsn of fsns) {
+    const catTab = (useCategories && catData.map[fsn]) || 'Uncategorized';
+    if (!chunkCatFSNs[catTab]) chunkCatFSNs[catTab] = [];
+    chunkCatFSNs[catTab].push(fsn);
+  }
+  const sortedCategories = Object.entries(chunkCatFSNs).sort((a, b) => b[1].length - a[1].length);
+
+  console.log(`\nCategories in this chunk: ${sortedCategories.length}`);
+  for (const [cat, catFsns] of sortedCategories) {
+    console.log(`  ${cat}: ${catFsns.length} FSNs`);
   }
 
   // Launch browser
-  console.log('\nLaunching Chromium...');
+  console.log(`\nLaunching Chromium with ${PARALLEL_WORKERS} worker pages...`);
   const browser = await puppeteer.launch({
     headless: 'new',
     args: [
@@ -679,158 +845,90 @@ async function main() {
     ]
   });
 
-  // Sequential scraping with a single page (CONCURRENCY=1)
-  let page = await createWorkerPage(browser);
-  let totalProcessed = 0;
-  let totalErrors = 0;
-  let consecutiveErrors = 0;
-  let pendingWrites = [];
+  // Create page pool
+  const pagePool = new PagePool();
+  const numWorkers = Math.min(PARALLEL_WORKERS, sortedCategories.length);
+  for (let w = 0; w < numWorkers; w++) {
+    const page = await createWorkerPage(browser);
+    pagePool.add(page);
+    if (w < numWorkers - 1) await delay(1000); // stagger page creation
+  }
+  console.log(`${numWorkers} worker pages ready`);
 
-  for (let i = 0; i < fsns.length; i++) {
-    const fsn = fsns[i];
-    const elapsedMin = (Date.now() - startTime) / 60000;
-    const elapsed = elapsedMin.toFixed(1);
-    console.log(`[${i + 1}/${fsns.length}] ${fsn} (${elapsed}m)`);
+  // Shared state with mutex-protected flush
+  const state = {
+    startTime,
+    aborted: false,
+    consecutiveErrors: 0,
+    totalProcessed: 0,
+    totalErrors: 0,
+    nextWorkerId: 0,
+    fsnRowMap,
+    pendingWrites: [],
+    _flushing: false,
 
-    // Safety: abort if approaching GH Actions timeout
-    if (elapsedMin >= MAX_ELAPSED_MINUTES) {
-      console.log(`\n>> TIME LIMIT: ${elapsed}m elapsed (limit ${MAX_ELAPSED_MINUTES}m). Stopping to save progress.`);
-      break;
-    }
+    async flush(force = false) {
+      if (this._flushing) return;
+      if (!force && this.pendingWrites.length < BATCH_SIZE * 2) return;
+      if (!token || this.pendingWrites.length === 0) return;
 
-    // Abort if IP is clearly blocked (too many consecutive errors)
-    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-      console.log(`\n>> IP BLOCKED: ${consecutiveErrors} consecutive errors. Aborting to avoid wasting time.`);
-      break;
-    }
-
-    // Rotate User-Agent per FSN
-    await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
-
-    // Load page with retry + exponential backoff
-    let info = null;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      info = await loadProductPage(page, fsn);
-      if (info.name !== 'Error') break;
-      if (attempt < MAX_RETRIES) {
-        const retryDelay = RETRY_DELAYS[attempt];
-        console.log(`  Retry ${attempt + 1}/${MAX_RETRIES} after ${retryDelay / 1000}s...`);
-        await page.goto('about:blank').catch(() => {});
-        await delay(retryDelay);
-      }
-    }
-
-    const row = [fsn, info.name, info.mrp, info.sp];
-
-    if (info.name === 'Error') {
-      totalErrors++;
-      consecutiveErrors++;
-      // On 10+ consecutive errors, recycle the page (fresh connection/cookies)
-      if (consecutiveErrors >= 10 && consecutiveErrors % 10 === 0) {
-        console.log(`  >> ${consecutiveErrors} consecutive errors — recycling page + waiting 30s`);
-        await page.close().catch(() => {});
-        await delay(30000);
-        page = await createWorkerPage(browser);
-      } else if (consecutiveErrors >= 5) {
-        console.log(`  >> ${consecutiveErrors} consecutive errors — pausing 15s`);
-        await page.goto('about:blank').catch(() => {});
-        await delay(15000);
-      } else if (consecutiveErrors >= 3) {
-        console.log(`  >> ${consecutiveErrors} consecutive errors — pausing 5s`);
-        await page.goto('about:blank').catch(() => {});
-        await delay(5000);
-      }
-    } else {
-      consecutiveErrors = 0;
-    }
-
-    // Check each pincode WITHOUT reloading
-    for (let p = 0; p < PINCODES.length; p++) {
-      let delivery;
+      this._flushing = true;
+      const batch = this.pendingWrites.splice(0);
       try {
-        delivery = await checkPincode(page, PINCODES[p]);
+        await sheetsAPI('POST',
+          `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
+          { valueInputOption: 'RAW', data: batch }, token
+        );
+        console.log(`  >> Flushed ${batch.length} ranges`);
       } catch (e) {
-        delivery = { dd: 'Error', available: false };
-      }
-      const inStock = info.available && delivery.available;
-      row.push(inStock ? 'In Stock' : 'Out of Stock', delivery.dd);
-    }
-
-    row.push(new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }));
-    totalProcessed++;
-
-    // Queue writes for both Tracker and category tab
-    const rowInfo = fsnRowMap[fsn];
-    if (rowInfo) {
-      pendingWrites.push({
-        range: `Tracker!A${rowInfo.trackerRow}:M${rowInfo.trackerRow}`,
-        values: [row]
-      });
-      if (rowInfo.catTab && rowInfo.catRow) {
-        pendingWrites.push({
-          range: `'${rowInfo.catTab}'!A${rowInfo.catRow}:M${rowInfo.catRow}`,
-          values: [row]
-        });
-      }
-    }
-
-    // Flush every BATCH_SIZE FSNs or at end
-    if (pendingWrites.length >= BATCH_SIZE * 2 || i === fsns.length - 1) {
-      if (token && pendingWrites.length > 0) {
+        console.error(`  >> Sheet write error: ${e.message}`);
         try {
+          token = await getAccessToken(saConfig);
           await sheetsAPI('POST',
             `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
-            { valueInputOption: 'RAW', data: pendingWrites }, token
+            { valueInputOption: 'RAW', data: batch }, token
           );
-          console.log(`  >> Flushed ${pendingWrites.length} ranges`);
-        } catch (e) {
-          console.error(`  >> Sheet write error: ${e.message}`);
-          try {
-            token = await getAccessToken(saConfig);
-            await sheetsAPI('POST',
-              `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
-              { valueInputOption: 'RAW', data: pendingWrites }, token
-            );
-          } catch (e2) {
-            console.error(`  >> Retry failed: ${e2.message}`);
-          }
+        } catch (e2) {
+          console.error(`  >> Retry failed: ${e2.message} — ${batch.length} writes lost`);
         }
-        pendingWrites = [];
       }
+      this._flushing = false;
     }
+  };
 
-    // Delay between FSNs: 3s + random 0-2s jitter
-    if (i < fsns.length - 1) {
-      const jitter = Math.floor(Math.random() * 2000);
-      await delay(3000 + jitter);
+  // Periodic flush safety net (every 30s)
+  const flushInterval = setInterval(() => state.flush(true), 30000);
+
+  // Launch all categories as parallel tasks gated by semaphore
+  const semaphore = new Semaphore(numWorkers);
+  const promises = sortedCategories.map(([catName, catFsns]) =>
+    processCategory(catName, catFsns, pagePool, semaphore, state, browser)
+  );
+
+  const results = await Promise.allSettled(promises);
+
+  // Log any category-level failures
+  for (let i = 0; i < results.length; i++) {
+    if (results[i].status === 'rejected') {
+      console.error(`Category "${sortedCategories[i][0]}" failed: ${results[i].reason}`);
     }
   }
 
-  // Flush any remaining pending writes before closing
-  if (token && pendingWrites.length > 0) {
-    try {
-      await sheetsAPI('POST',
-        `/v4/spreadsheets/${SPREADSHEET_ID}/values:batchUpdate`,
-        { valueInputOption: 'RAW', data: pendingWrites }, token
-      );
-      console.log(`  >> Final flush: ${pendingWrites.length} ranges`);
-    } catch (e) {
-      console.error(`  >> Final flush failed: ${e.message}`);
-    }
-    pendingWrites = [];
-  }
+  // Final flush
+  clearInterval(flushInterval);
+  await state.flush(true);
 
-  await page.close();
   await browser.close();
 
   const totalTime = ((Date.now() - startTime) / 60000).toFixed(1);
   console.log(`\n=== COMPLETE ===`);
-  console.log(`Processed: ${totalProcessed}/${fsns.length} FSNs`);
-  console.log(`Errors: ${totalErrors}`);
+  console.log(`Processed: ${state.totalProcessed}/${fsns.length} FSNs`);
+  console.log(`Errors: ${state.totalErrors}`);
+  console.log(`Workers: ${numWorkers} parallel pages`);
   console.log(`Time: ${totalTime} minutes`);
   console.log(`Sheet: https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}`);
 
-  if (totalErrors > fsns.length * 0.5) {
+  if (state.totalErrors > fsns.length * 0.5) {
     console.error('WARNING: More than 50% errors. Flipkart may be blocking this IP.');
     process.exit(1);
   }
