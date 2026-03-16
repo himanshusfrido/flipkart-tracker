@@ -2,7 +2,7 @@
 # Flipkart Product Tracker - GitHub Actions Workflow
 # ============================================================
 # Runs 3x daily at 10:30 AM, 4:30 PM, 10:30 PM IST
-# Splits 771 FSNs across 2 parallel jobs
+# Splits 771 FSNs across 4 parallel jobs (~27 min per run)
 #
 # IMPORTANT: This must be in a PUBLIC repository for FREE
 # unlimited minutes. Private repos have a 2000 min/month limit.
@@ -41,12 +41,12 @@ jobs:
 
     strategy:
       matrix:
-        chunk: [0, 1]
+        chunk: [0, 1, 2, 3]
       fail-fast: false  # Don't cancel other chunks if one fails
-      max-parallel: 2   # Both chunks run simultaneously
+      max-parallel: 4   # All chunks run simultaneously (each gets own IP)
 
     env:
-      TOTAL_CHUNKS: 2
+      TOTAL_CHUNKS: 4
       GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY }}
 
     steps:

@@ -312,7 +312,7 @@ async function loadProductPage(page, fsn) {
                document.body.innerText.length > 500;
       }, { timeout: 10000 });
     } catch (e) {}
-    await delay(1500);
+    await delay(1000);
 
     // Close login popup
     try {
@@ -322,7 +322,7 @@ async function loadProductPage(page, fsn) {
         if (t.includes('\u2715') || t.includes('\u00D7')) { await b.click(); break; }
       }
     } catch (e) {}
-    await delay(300);
+    await delay(200);
 
     // Extract product info from JSON-LD structured data (most reliable)
     const info = await page.evaluate(() => {
@@ -497,7 +497,7 @@ async function checkPincode(page, pincode) {
         return false;
       });
       if (!applyClicked) console.log(`    Pin ${pincode}: WARNING — Apply button not found`);
-      await delay(2500);
+      await delay(1500);
     } else {
       console.log(`    Pin ${pincode}: WARNING — pincode input not found`);
     }
@@ -709,9 +709,9 @@ async function processCategory(catName, fsnList, pagePool, semaphore, state, bro
         await state.flush();
       }
 
-      // Inter-FSN delay (reduced since parallel workers provide natural spacing)
+      // Inter-FSN delay (reduced — 4 runners with separate IPs provide natural spacing)
       if (i < fsnList.length - 1) {
-        await delay(2000 + Math.floor(Math.random() * 1500));
+        await delay(1500 + Math.floor(Math.random() * 1000));
       }
     }
   } finally {
