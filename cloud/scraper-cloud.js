@@ -382,17 +382,41 @@ async function loadProductPage(page, fsn) {
 // Enter/change pincode and extract delivery info (without reloading the page)
 async function checkPincode(page, pincode) {
   try {
-    // Click delivery location link (single evaluate — no round-trips)
-    await page.evaluate(() => {
-      const els = document.querySelectorAll('a, div, span');
+    // Click delivery location trigger — use partial, case-insensitive matching
+    const clickResult = await page.evaluate(() => {
+      const triggers = [
+        'select delivery location',
+        'enter pincode',
+        'change',
+      ];
+      // Search a, div, span — prefer short text (avoids matching parent containers)
+      let best = null;
+      let bestLen = Infinity;
+      const els = document.querySelectorAll('a, div, span, button');
       for (const el of els) {
-        const t = el.textContent.trim();
-        if (t === 'Select delivery location' || t === 'Change' || t === 'Enter pincode') {
-          el.click();
-          break;
+        const t = (el.textContent || '').trim().toLowerCase();
+        if (t.length > 50) continue; // skip containers with long text
+        for (const trigger of triggers) {
+          if (t === trigger || t.includes(trigger)) {
+            if (t.length < bestLen) {
+              best = el;
+              bestLen = t.length;
+            }
+          }
+        }
+        // Also match if element shows a 6-digit pincode (the "110001" link)
+        if (/^\d{6}$/.test(t) && t.length < bestLen) {
+          best = el;
+          bestLen = t.length;
         }
       }
+      if (best) {
+        best.click();
+        return { clicked: true, text: best.textContent.trim().substring(0, 40) };
+      }
+      return { clicked: false, text: null };
     });
+    console.log(`    Pin ${pincode}: trigger=${clickResult.text || 'NONE'}`);
 
     // Wait for pincode input to appear
     let inputFound = false;
@@ -407,18 +431,43 @@ async function checkPincode(page, pincode) {
       }, { timeout: 5000 });
       inputFound = true;
     } catch (e) {
-      // Input didn't appear — try direct entry anyway
+      // Input didn't appear — try clicking the pincode display text as fallback
+      if (!inputFound) {
+        try {
+          await page.evaluate(() => {
+            const els = document.querySelectorAll('span, div, a');
+            for (const el of els) {
+              const t = (el.textContent || '').trim();
+              if (/^\d{6}$/.test(t)) { el.click(); return; }
+            }
+          });
+          await page.waitForFunction(() => {
+            const inputs = document.querySelectorAll('input');
+            for (const inp of inputs) {
+              const ph = (inp.placeholder || '').toLowerCase();
+              if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter')) return true;
+            }
+            return false;
+          }, { timeout: 3000 });
+          inputFound = true;
+        } catch (e2) {}
+      }
     }
 
     if (inputFound) {
-      // Fill pincode using evaluate (fast, no round-trips per element)
+      // Clear existing value, then fill new pincode
       await page.evaluate((pin) => {
         const inputs = document.querySelectorAll('input');
         for (const inp of inputs) {
           const ph = (inp.placeholder || '').toLowerCase();
           if (ph.includes('pincode') || ph.includes('pin code') || ph.includes('enter')) {
+            // Focus and select all existing text first
+            inp.focus();
+            inp.select();
             // Clear and set value using native input setter (React-compatible)
             const nativeSet = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+            nativeSet.call(inp, '');
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
             nativeSet.call(inp, pin);
             inp.dispatchEvent(new Event('input', { bubbles: true }));
             inp.dispatchEvent(new Event('change', { bubbles: true }));
@@ -428,15 +477,17 @@ async function checkPincode(page, pincode) {
       }, pincode);
       await delay(500);
 
-      // Click Apply/Check/Submit button
+      // Click Apply/Check/Submit button (partial match)
       await page.evaluate(() => {
         const btns = document.querySelectorAll('button, span');
         for (const b of btns) {
-          const t = b.textContent.trim();
-          if (t === 'Apply' || t === 'Check' || t === 'Submit') { b.click(); break; }
+          const t = (b.textContent || '').trim().toLowerCase();
+          if (t === 'apply' || t === 'check' || t === 'submit') { b.click(); break; }
         }
       });
       await delay(2500);
+    } else {
+      console.log(`    Pin ${pincode}: WARNING — pincode input not found`);
     }
 
     // Extract delivery info — scoped to delivery section, not full page
@@ -475,8 +526,10 @@ async function checkPincode(page, pincode) {
       return { dd, available: true };
     });
 
+    console.log(`    Pin ${pincode}: delivery=${delivery.dd}, available=${delivery.available}`);
     return delivery;
   } catch (e) {
+    console.log(`    Pin ${pincode}: ERROR — ${e.message}`);
     return { dd: 'Error', available: false };
   }
 }
